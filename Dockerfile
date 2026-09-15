@@ -114,3 +114,5 @@ ENV PYTHONUNBUFFERED=1 \
 # Sensible default for the web dashboard (compose overrides with the same command,
 # but this makes `docker run <web-image>` work out of the box on port 8010).
 CMD ["uvicorn", "web.main:app", "--host", "0.0.0.0", "--port", "8010"]
+# Railway builds the last stage unless a target is set
+FROM bot AS railway

@@ -160,7 +160,7 @@ _VERSUS_EMOJIS = ("🔵", "🔴")
 
 def _format_metric(value: int | None, *, suffix: str = "") -> str:
     if value is None:
-        return "No disponible"
+        return "Unavailable"
     return f"**{value:,}**{suffix}"
 
 
@@ -204,7 +204,7 @@ def _build_versus_embeds(
             embeds.append(
                 discord.Embed(
                     title=f"{emoji} {display_name}",
-                    description="No se encontró este juego en Steam ni en Twitch.",
+                    description="This game was not found on Steam or Twitch.",
                     color=color,
                 )
             )
@@ -222,14 +222,14 @@ def _build_versus_embeds(
 
         if steam_data:
             pc = steam_data.get("player_count")
-            steam_line = _format_metric(pc, suffix=" jugadores en Steam")
+            steam_line = _format_metric(pc, suffix=" players on Steam")
             if steam_data.get("player_count_source") == "demo" and "demo" not in display_name.lower():
-                steam_line += " (vía Demo)"
+                steam_line += " (via Demo)"
             embed.add_field(name="🎮 Steam", value=steam_line, inline=False)
         else:
             embed.add_field(
                 name="🎮 Steam",
-                value="No encontrado en Steam",
+                value="Not found on Steam",
                 inline=False,
             )
 
@@ -237,20 +237,20 @@ def _build_versus_embeds(
             if twitch_found:
                 viewers = twitch_data.get("viewer_count")
                 streams = twitch_data.get("live_streams")
-                twitch_line = _format_metric(viewers, suffix=" espectadores en Twitch")
+                twitch_line = _format_metric(viewers, suffix=" viewers on Twitch")
                 if isinstance(streams, int):
-                    twitch_line += f"\n{streams:,} streams en vivo"
+                    twitch_line += f"\n{streams:,} live streams"
                 embed.add_field(name="📺 Twitch", value=twitch_line, inline=False)
             else:
                 embed.add_field(
                     name="📺 Twitch",
-                    value="Categoría no encontrada en Twitch",
+                    value="Category not found on Twitch",
                     inline=False,
                 )
         elif twitch_data and not twitch_data.get("configured"):
             embed.add_field(
                 name="📺 Twitch",
-                value="Twitch no configurado (TWITCH_CLIENT_ID/SECRET)",
+                value="Twitch not configured (TWITCH_CLIENT_ID/SECRET)",
                 inline=False,
             )
 
@@ -274,17 +274,17 @@ def _build_versus_embeds(
         if steam_counts[0][1] > steam_counts[1][1]:
             header.add_field(
                 name="🏆 Steam",
-                value=f"**{steam_counts[0][0]}** lidera en jugadores",
+                value=f"**{steam_counts[0][0]}** leads in players",
                 inline=True,
             )
         elif steam_counts[1][1] > steam_counts[0][1]:
             header.add_field(
                 name="🏆 Steam",
-                value=f"**{steam_counts[1][0]}** lidera en jugadores",
+                value=f"**{steam_counts[1][0]}** leads in players",
                 inline=True,
             )
         else:
-            header.add_field(name="🏆 Steam", value="¡Empate!", inline=True)
+            header.add_field(name="🏆 Steam", value="Tie!", inline=True)
 
     twitch_counts = [
         (pairs[i][0], (pairs[i][2] or {}).get("viewer_count"))
@@ -295,17 +295,17 @@ def _build_versus_embeds(
         if twitch_counts[0][1] > twitch_counts[1][1]:
             header.add_field(
                 name="🏆 Twitch",
-                value=f"**{twitch_counts[0][0]}** lidera en espectadores",
+                value=f"**{twitch_counts[0][0]}** leads in viewers",
                 inline=True,
             )
         elif twitch_counts[1][1] > twitch_counts[0][1]:
             header.add_field(
                 name="🏆 Twitch",
-                value=f"**{twitch_counts[1][0]}** lidera en espectadores",
+                value=f"**{twitch_counts[1][0]}** leads in viewers",
                 inline=True,
             )
         else:
-            header.add_field(name="🏆 Twitch", value="¡Empate!", inline=True)
+            header.add_field(name="🏆 Twitch", value="Tie!", inline=True)
 
     return embeds
 
@@ -323,11 +323,11 @@ def _build_steam_game_embeds(games: list[dict[str, Any]]) -> list[discord.Embed]
         image_url = g.get("image_url")
         color = steam.get_game_color(name)
         if player_count is not None:
-            description = f"**{player_count:,}** jugadores ahora"
+            description = f"**{player_count:,}** players now"
             if g.get("player_count_source") == "demo" and "demo" not in name.lower():
-                description += " (vía Demo en Steam)"
+                description += " (via Steam Demo)"
         else:
-            description = "Conteo de jugadores no disponible en Steam Charts ahora mismo."
+            description = "Player count unavailable on Steam Charts right now."
         embed = discord.Embed(
             title=name,
             description=description,
@@ -465,12 +465,12 @@ def register_slash_commands(
     """Register Groksito slash commands. Steam commands delegate to discord/integrations/steam.py."""
     # /mislimites ΓÇö shows remaining requests for the current user (rate limit info)
     @tree.command(
-        name="mislimites", description="Muestra cu├íntas requests te quedan en este minuto"
+        name="mislimites", description="Show how many requests you have left this minute"
     )
     async def mislimites(interaction: discord.Interaction):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no est├í disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -478,7 +478,7 @@ def register_slash_commands(
         rl = getattr(client, "rate_limiter", rate_limiter)
         remaining = rl.get_remaining(user_id)
         await interaction.response.send_message(
-            f"**{interaction.user.display_name}**, te quedan **{remaining}/6** requests en este minuto.",
+            f"**{interaction.user.display_name}**, you have **{remaining}/6** requests left this minute.",
             ephemeral=True,
         )
 
@@ -489,12 +489,12 @@ def register_slash_commands(
     # If no thumbnail resolves, falls back to the standard Steam header.jpg (same as /stmchr).
     @tree.command(
         name="steamchart",
-        description="Muestra jugadores concurrentes en Steam. Ej: /steamchart black desert, path of exile 2",
+        description="Live Steam player counts. Ex: /steamchart dota 2, path of exile 2",
     )
     async def steamchart(interaction: discord.Interaction, juegos: Optional[str] = None):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no est├í disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -507,9 +507,9 @@ def register_slash_commands(
 
         if not games_data:
             await interaction.followup.send(
-                "No pude reconocer ningún juego con ese nombre en Steam. "
-                "Prueba el nombre exacto como aparece en la tienda (ej. 'Embers of the Uncrowned', "
-                "'dota 2', 'counter-strike 2'). O usa /stmchr para la lista fija de siempre."
+                "Could not match that name on Steam. "
+                "Use the store name (e.g. 'dota 2', 'counter-strike 2') "
+                "or run /stmchr for the fixed list."
             )
             return
 
@@ -521,12 +521,12 @@ def register_slash_commands(
     # so games with only hashed asset paths (WWM, TBH, etc.) still get images.
     # Each embed gets a game-specific color and the title links to the Steam store page.
     @tree.command(
-        name="stmchr", description="Black Desert, PoE2, GW2, Lost Ark, Crimson Desert y m├ís"
+        name="stmchr", description="Fixed list: Black Desert, PoE2, GW2, Lost Ark, and more"
     )
     async def stmchr(interaction: discord.Interaction):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no est├í disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -541,7 +541,7 @@ def register_slash_commands(
         if games_data:
             await interaction.followup.send(embeds=_build_steam_game_embeds(games_data))
         else:
-            await interaction.followup.send("No se pudo obtener datos de Steam Charts en este momento.")
+            await interaction.followup.send("Could not fetch Steam Charts data right now.")
 
     # /topgames ΓÇö shows the real-time Top 10 (or so) games by current players
     # directly from https://steamcharts.com/top (not a fixed list like /stmchr).
@@ -551,12 +551,12 @@ def register_slash_commands(
     # Fetches fresh current counts via the official Steam API for consistency.
     @tree.command(
         name="topgames",
-        description="Top 10 juegos con m├ís jugadores actuales en Steam (de steamcharts.com/top)"
+        description="Top 10 games by current Steam players (steamcharts.com/top)"
     )
     async def topgames(interaction: discord.Interaction):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no est├í disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -564,7 +564,7 @@ def register_slash_commands(
 
         top_list = await steam.get_top_steam_games(10)
         if not top_list:
-            await interaction.followup.send("No se pudo obtener la lista de top juegos en este momento.")
+            await interaction.followup.send("Could not fetch the top games list right now.")
             return
 
         names_csv = ", ".join(name for name, _ in top_list)
@@ -577,7 +577,7 @@ def register_slash_commands(
         )
 
         if not games_data:
-            await interaction.followup.send("No se pudo obtener datos de Steam Charts en este momento.")
+            await interaction.followup.send("Could not fetch Steam Charts data right now.")
             return
 
         await interaction.followup.send(embeds=_build_steam_game_embeds(games_data))
@@ -613,7 +613,7 @@ def register_slash_commands(
     # English display consistent with /topkorea. Added 2026-06-22.
     @tree.command(
         name="korea50",
-        description="Top 50 weekly popularity ranking from Gamemeca (인기 게임 순위)"
+        description="Top 50 weekly game popularity from Gamemeca"
     )
     async def korea50(interaction: discord.Interaction):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
@@ -637,7 +637,7 @@ def register_slash_commands(
     # /versus — compare two games with live Steam player counts + Twitch viewers.
     @tree.command(
         name="versus",
-        description="Compara dos juegos: jugadores en Steam y espectadores en Twitch. Ej: /versus dota 2 cs2",
+        description="Compare two games: Steam players and Twitch viewers",
     )
     async def versus(
         interaction: discord.Interaction,
@@ -646,7 +646,7 @@ def register_slash_commands(
     ):
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no está disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -654,14 +654,14 @@ def register_slash_commands(
         g2 = (juego2 or "").strip()
         if not g1 or not g2:
             await interaction.response.send_message(
-                "Indica dos juegos para comparar. Ejemplo: `/versus dota 2 counter-strike 2`",
+                "Give two games to compare. Example: `/versus dota 2 counter-strike 2`",
                 ephemeral=True,
             )
             return
 
         if g1.lower() == g2.lower():
             await interaction.response.send_message(
-                "Elige dos juegos distintos para el versus.",
+                "Pick two different games for versus.",
                 ephemeral=True,
             )
             return
@@ -687,9 +687,8 @@ def register_slash_commands(
 
         if not steam_games and not any(t.get("found") for t in twitch_games):
             await interaction.followup.send(
-                "No pude reconocer ninguno de los dos juegos en Steam ni en Twitch. "
-                "Prueba nombres como aparecen en la tienda o en Twitch "
-                "(ej. 'dota 2', 'counter-strike 2', 'Embers of the Uncrowned')."
+                "Could not recognize either game on Steam or Twitch. "
+                "Use store/Twitch names (e.g. 'dota 2', 'counter-strike 2')."
             )
             return
 
@@ -707,20 +706,20 @@ def register_slash_commands(
     # - Ephemeral confirmation after; the voice bubble itself is delivered publicly in channel.
     @tree.command(
         name="audio",
-        description="Genera audio TTS. Inline: [pause][laugh][sigh]. Elige estilo envolvente. Responde a un mensaje.",
+        description="Generate a TTS voice message. Optional: reply to a message.",
     )
     @discord.app_commands.describe(
-        text="Texto a leer. Inline: [pause], [laugh], [sigh], [breath], [chuckle], [long-pause], etc.",
-        voice="Voz de Grok para el audio (eve recomendada).",
-        estilo="Estilo envolvente opcional: whisper, soft, slow, loud, emphasis, singing, etc.",
+        text="Text to speak. Inline: [pause], [laugh], [sigh], [breath], [chuckle], [long-pause].",
+        voice="Grok TTS voice (eve recommended).",
+        estilo="Optional delivery style: whisper, soft, slow, loud, emphasis, singing.",
     )
     @discord.app_commands.choices(
         voice=[
-            discord.app_commands.Choice(name="Eve (energética, recomendada)", value="eve"),
-            discord.app_commands.Choice(name="Ara (cálida)", value="ara"),
-            discord.app_commands.Choice(name="Rex (profesional)", value="rex"),
-            discord.app_commands.Choice(name="Sal (equilibrada)", value="sal"),
-            discord.app_commands.Choice(name="Leo (autoritativa)", value="leo"),
+            discord.app_commands.Choice(name="Eve (energetic, recommended)", value="eve"),
+            discord.app_commands.Choice(name="Ara (warm)", value="ara"),
+            discord.app_commands.Choice(name="Rex (professional)", value="rex"),
+            discord.app_commands.Choice(name="Sal (balanced)", value="sal"),
+            discord.app_commands.Choice(name="Leo (authoritative)", value="leo"),
         ],
         estilo=[
             discord.app_commands.Choice(name=label, value=tag)
@@ -736,7 +735,7 @@ def register_slash_commands(
         # Guild whitelist (same as every other slash command)
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no está disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -745,7 +744,7 @@ def register_slash_commands(
         can_use, _ = rl.check(interaction.user.id)
         if not can_use:
             await interaction.response.send_message(
-                "Tranquilo campeón, ya usaste tus 6 requests este minuto.", ephemeral=True
+                "Slow down — you already used your 6 requests this minute.", ephemeral=True
             )
             return
 
@@ -813,7 +812,7 @@ def register_slash_commands(
     # Reuses the exact same audio pipeline as /audio (text prep, xAI TTS, waveform bubble,
     # direct delivery via image_delivery sentinel, rate limiting, guild whitelist).
     # This restores the dedicated "context menu read aloud" UX (no reply + slash needed).
-    @tree.context_menu(name="🔊 Leer en voz alta")
+    @tree.context_menu(name="Read aloud")
     async def read_aloud_context(
         interaction: discord.Interaction,
         message: discord.Message,
@@ -821,7 +820,7 @@ def register_slash_commands(
         # Guild whitelist (identical to every other command)
         if interaction.guild and not is_guild_allowed(interaction.guild.id):
             await interaction.response.send_message(
-                "Groksito no está disponible en este servidor.", ephemeral=True
+                "Meepo is not available in this server.", ephemeral=True
             )
             return
 
@@ -830,7 +829,7 @@ def register_slash_commands(
         can_use, _ = rl.check(interaction.user.id)
         if not can_use:
             await interaction.response.send_message(
-                "Tranquilo campeón, ya usaste tus 6 requests este minuto.", ephemeral=True
+                "Slow down — you already used your 6 requests this minute.", ephemeral=True
             )
             return
 
@@ -1187,7 +1186,7 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             rl = getattr(_discord_client, "rate_limiter", rate_limiter)
             can_use, _ = rl.check(message.author.id)
             if not can_use:
-                await _safe_reply(message, "Tranquilo campe├│n, ya usaste tus 6 requests este minuto.", mention_author=False)
+                await _safe_reply(message, "Slow down — you already used your 6 requests this minute.", mention_author=False)
                 return
 
             # Rich context + meta detection

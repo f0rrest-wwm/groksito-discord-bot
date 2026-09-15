@@ -953,7 +953,7 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             logger.warning("[SECURITY] No ALLOWED_GUILD_IDS set ΓÇö bot will respond in ANY server.")
 
         try:
-            await _discord_client.change_presence(activity=discord.Game(name="con Grok"))
+            await _discord_client.change_presence(activity=discord.Game(name="yapping"))
             await tree.sync()
             logger.info("Γ£à Slash commands synchronized")
         except Exception as e:

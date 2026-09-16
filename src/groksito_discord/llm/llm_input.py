@@ -482,7 +482,7 @@ async def build_responses_input(
     if dynamic_context_block:
         context_prefix_parts.append(dynamic_context_block)
     if emoji_full_block:
-    context_prefix_parts.append(emoji_full_block)
+        context_prefix_parts.append(emoji_full_block)
     context_note = "\n\n".join(context_prefix_parts).strip()
 
     # Prepend context note (now may include attachments_block prepended to it) into

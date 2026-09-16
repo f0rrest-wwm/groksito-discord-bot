@@ -929,7 +929,7 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
     # This call must happen after the client and rate_limiter are attached.
     # All three commands (/mislimites, /steamchart, /stmchr) are now defined
     # in register_slash_commands above.
-    register_slash_commands(tree, _discord_client)
+    # register_slash_commands(tree, _discord_client)
 
     # Lazy import of conversational stack (keeps things clean)
     from .. import context

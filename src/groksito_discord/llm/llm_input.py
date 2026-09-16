@@ -474,14 +474,14 @@ async def build_responses_input(
     # Both are already gated to addressed turns inside their builders.
     # Attachments block (if present) is prepended BEFORE the ref/emoji note, per design
     # (it's "Attachments sent with this message", most immediate to current turn content).
-    context_prefix_parts: list[str] = []
-      if speaker_line:
+        context_prefix_parts: list[str] = []
+    if speaker_line:
         context_prefix_parts.append(speaker_line)
-      if attachments_block:
+    if attachments_block:
         context_prefix_parts.append(attachments_block)
-      if dynamic_context_block:
+    if dynamic_context_block:
         context_prefix_parts.append(dynamic_context_block)
-      if emoji_full_block:
+    if emoji_full_block:
         context_prefix_parts.append(emoji_full_block)
     context_note = "\n\n".join(context_prefix_parts).strip()
 

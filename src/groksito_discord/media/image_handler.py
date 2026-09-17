@@ -210,6 +210,8 @@ _EXPAND_SYSTEM = (
     "On-image text only if the user named a title; copy that title exactly. "
     "Do not put words like poster, prompt, 9:16, Discord, Meepo, or Grok in the picture. "
     "Match their style: photograph vs illustration vs cinematic game key art. "
+    "If they say poster or key art, use AAA cinematic launch-key-art, realistic materials, "
+    "deep contrast — not a bright cute gacha banner and not a four-legged chibi mascot unless they asked for that. "
     "Keep everyone fully clothed. No nudes."
 )
 
@@ -328,30 +330,27 @@ def _ultra_safe_artistic_fallback(original_prompt: str) -> str:
 
 
 def _soften_prompt_for_artistic(prompt: str) -> str:
-    """
-    Relaxed/permissive safety rewrite used ONLY on actual policy/422 errors.
-    Keeps bikini/lingerie/tetona/culona/curvy/sexy fantasy intent. Only remaps hard blocks.
-    """
+    """Policy retry: strip sexual intent. Do not remap nudes into lingerie."""
     if not prompt:
-        return "a beautiful stylized artistic character portrait in dramatic lighting"
+        return "a fully clothed character in a cinematic non-sexual scene"
 
     original = prompt.strip()
     p = original
 
     replacements = [
-        (r"\b(culona|culazo|nalgona|culon)\b", "curvy wide hips"),
-        (r"\b(tetona|tetas?)\b", "busty tetona"),
-        (r"\b(nude|naked|desnuda|desnudo|fully naked|completely nude|sin ropa)\b", "in a tiny sexy bikini"),
-        (r"\btopless\b", "in a revealing low-cut bikini top"),
-        (r"\bbottomless\b", "in a micro bikini bottom"),
-        (r"\b(pussy|vagina|clit|clitoris)\b", "intimate area"),
+        (r"\b(culona|culazo|nalgona|culon)\b", "figure"),
+        (r"\b(tetona|tetas?)\b", "character"),
+        (r"\b(nude|naked|desnuda|desnudo|fully naked|completely nude|sin ropa)\b", "fully clothed"),
+        (r"\btopless\b", "fully clothed"),
+        (r"\bbottomless\b", "fully clothed"),
+        (r"\b(pussy|vagina|clit|clitoris)\b", ""),
         (r"\b(dick|cock|pene|verga|pija|balls)\b", ""),
-        (r"\b(erect|erection|hard dick)\b", "intense expression"),
-        (r"\b(follar|coger|fucking|fuck|having sex|intercourse|penetrat)\b", "intense dynamic pose"),
-        (r"\b(blowjob|oral sex|69|cum|semen)\b", "dramatic expression"),
-        (r"\b(nsfw|porn|porno|hentai|xxx|lewd|ecchi)\b", "artistic fantasy"),
-        (r"\b(ahegao)\b", "ecstatic expression"),
-        (r"\b(spread legs|legs spread|ass up|piernas abiertas|en cuatro|a cuatro patas)\b", "dynamic pose"),
+        (r"\b(erect|erection|hard dick)\b", ""),
+        (r"\b(follar|coger|fucking|fuck|having sex|intercourse|penetrat)\b", ""),
+        (r"\b(blowjob|oral sex|69|cum|semen)\b", ""),
+        (r"\b(nsfw|porn|porno|hentai|xxx|lewd|ecchi)\b", ""),
+        (r"\b(ahegao)\b", ""),
+        (r"\b(spread legs|legs spread|ass up|piernas abiertas|en cuatro|a cuatro patas)\b", "standing pose"),
     ]
 
     for pattern, repl in replacements:
@@ -381,7 +380,7 @@ def _soften_prompt_for_artistic(prompt: str) -> str:
     if any(w in p.lower() for w in ["style", "artistic", "illustration", "render", "masterpiece", "cinematic", "lighting"]):
         final = p
     else:
-        final = f"{p}, {enhancer}"
+        final = f"{p}, {enhancer}, fully clothed, non-sexual"
 
     final = re.sub(r"\s+", " ", final).strip().strip(",")
     final = _de_risk_text(final)
@@ -695,6 +694,7 @@ async def _tool_edit_image(
     reference_urls: list[str] | None = None,
     aspect_ratio: str | None = None,
     request_id: Optional[str] = None,
+    user_caption_source: str | None = None,
     **extra_params: Any,
 ) -> str:
     """
@@ -715,8 +715,12 @@ async def _tool_edit_image(
 
     refs = (reference_urls or [])[:3]
     refs = await _resolve_edit_reference_urls(refs)
-    # Enhance the user's edit instruction (modern quality pass)
-    enhanced_prompt = _enhance_prompt_for_api(prompt, is_edit=True)
+    seed = (user_caption_source or prompt or "").strip() or prompt
+    expanded = await _expand_like_website(seed)
+    enhanced_prompt = _enhance_prompt_for_api(expanded, is_edit=True)
+    low = seed.lower()
+    if not aspect_ratio and re.search(r"9\s*[:x]\s*16|portrait|phone poster|key art", low):
+        aspect_ratio = "9:16"
 
     try:
         max_attempts = getattr(settings, "api_max_retries", 3)
@@ -862,12 +866,25 @@ async def _handle_edit_image(args: dict, original_message: Any, image_urls: list
         except Exception as reg_err:
             logger.warning(f"{cid_prefix()}[Image] Failed to register edit request: {reg_err}")
 
+    user_caption_source = None
+    if original_message:
+        try:
+            content = (getattr(original_message, "content", "") or "").strip()
+            cleaned = re.sub(r"<@!?\d+>", " ", content)
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                user_caption_source = cleaned
+                prompt = cleaned
+        except Exception:
+            pass
+
     return await _tool_edit_image(
         prompt,
         reference_urls=image_urls,
         aspect_ratio=aspect,
         request_id=request_id,
-        **{k: v for k, v in args.items() if k not in ("prompt", "aspect_ratio", "aspect")}
+        user_caption_source=user_caption_source,
+        **{k: v for k, v in args.items() if k not in ("prompt", "aspect_ratio", "aspect", "user_caption_source")}
     )
 
 

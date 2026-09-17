@@ -201,8 +201,67 @@ def _strip_prompt_leaks(text: str) -> str:
     return p.strip(" ,")
 
 
+_EXPAND_SYSTEM = (
+    "You rewrite image requests for xAI Imagine, like grok.com Imagine. "
+    "Output ONLY the Imagine prompt. No quotes, no preamble, no bullet list. "
+    "Expand short lines into a detailed visual prompt: subject, pose, setting, "
+    "lighting, colors, camera, mood, composition. "
+    "If it is a poster or key art, describe a portrait 9:16 layout. "
+    "On-image text only if the user named a title; copy that title exactly. "
+    "Do not put words like poster, prompt, 9:16, Discord, Meepo, or Grok in the picture. "
+    "Match their style: photograph vs illustration vs cinematic game key art. "
+    "Keep everyone fully clothed. No nudes."
+)
+
+
+async def _expand_like_website(user_text: str) -> str:
+    """One hidden Grok pass so a one-liner becomes a grok.com-style Imagine prompt."""
+    raw = (user_text or "").strip()
+    if len(raw) < 2:
+        return raw
+    key = _resolve_api_key()
+    if not key:
+        return raw
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.post(
+                "https://api.x.ai/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": os.getenv("XAI_TEXT_MODEL", "grok-4.3"),
+                    "temperature": 0.6,
+                    "max_tokens": 400,
+                    "messages": [
+                        {"role": "system", "content": _EXPAND_SYSTEM},
+                        {"role": "user", "content": raw},
+                    ],
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning(
+                f"{cid_prefix()}[Image] expand failed HTTP {resp.status_code}: {(resp.text or '')[:180]}"
+            )
+            return raw
+        data = resp.json()
+        out = (
+            ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+            or ""
+        ).strip()
+        out = out.strip().strip('"').strip("'")
+        if len(out) < 8:
+            return raw
+        logger.info(f"{cid_prefix()}[Image] expanded one-liner → {len(out)} chars")
+        return out
+    except Exception as exc:
+        logger.warning(f"{cid_prefix()}[Image] expand exception: {exc}")
+        return raw
+
+
 def _enhance_prompt_for_api(original: str, is_edit: bool = False) -> str:
-    """Pass Grok's tool prompt through. Do not restyle, truncate, or force illustration."""
+    """Do not restyle. Only strip tool crumbs. Expansion happens in _expand_like_website."""
     if not original or len(original.strip()) < 2:
         return original or (
             "the requested scene, high detail"
@@ -365,9 +424,14 @@ async def _tool_generate_image(
     if not api_key:
         return "No xAI credential configured for image generation (run --login-oauth or set XAI_API_KEY)."
 
-    requested_prompt = prompt
-    # Modern improvement: always enhance for quality (Spanish support + artistic polish)
-    current_prompt = _enhance_prompt_for_api(requested_prompt, is_edit=False)
+    requested_prompt = (user_caption_source or prompt or "").strip() or prompt
+    expanded = await _expand_like_website(requested_prompt)
+    current_prompt = _enhance_prompt_for_api(expanded, is_edit=False)
+    seed = requested_prompt.lower()
+    if not aspect_ratio and re.search(r"9\s*[:x]\s*16|portrait|phone poster|key art", seed):
+        aspect_ratio = "9:16"
+    elif not aspect_ratio and re.search(r"16\s*[:x]\s*9|banner|wide poster", seed):
+        aspect_ratio = "16:9"
 
     try:
         max_attempts = getattr(settings, "api_max_retries", 3)
@@ -728,8 +792,13 @@ async def _handle_generate_image(args: dict, original_message: Any) -> str:
         try:
             content = (getattr(original_message, "content", "") or "").strip()
             # Use the raw user text if it looks like a creation request (keeps Spanish tone etc.)
-            if content and (len(content) < 280):
-                user_caption_source = content
+            if content:
+                # Prefer the Discord message so Imagine follows the user, not Meepo's tool string.
+                cleaned = re.sub(r"<@!?\d+>", " ", content)
+                cleaned = re.sub(r"\s+", " ", cleaned).strip()
+                if cleaned:
+                    user_caption_source = cleaned
+                    prompt = cleaned
         except Exception:
             pass
 

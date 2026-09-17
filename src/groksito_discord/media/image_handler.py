@@ -175,80 +175,64 @@ def _rewrite_to_concept_essence(original: str) -> str:
 # --- Modern Prompt Engineering (always-on quality pass + Spanish-friendly) ---
 
 def _enhance_prompt_for_api(original: str, is_edit: bool = False) -> str:
-    """
-    Modern internal prompt engineering step.
-
-    Goals:
-    - Improve results for typical Spanish user prompts (which are often short/colloquial).
-    - Preserve user intent 100% (especially permissive suggestive fantasy style).
-    - Add artistic enhancers, style detection, and quality hints without making the prompt robotic.
-    - Automatically rewrite "reimaginación de esencia" requests (e.g. "The Legend of Zelda if Hidetaka Miyazaki had created it")
-      into safe concept-only prompts that avoid naming protected IPs while keeping the artistic soul of the request.
-    - This runs on *every* request (success path). It is *not* safety softening.
-
-    Safety / policy remapping only happens in the error paths (see soften_image_prompt below).
-    """
+    """Light rewrite close to grok.com Imagine. Do not force illustration."""
     if not original or len(original.strip()) < 2:
-        return original or ("a beautiful stylized artistic character portrait in dramatic lighting" if not is_edit else "subtle artistic transformation, high detail")
+        return original or (
+            "a clear well-lit photograph of the requested subject"
+            if not is_edit
+            else "keep the subject, apply the requested change only"
+        )
 
     p = original.strip()
     lower = _strip_accents(p.lower())
 
-    # --- Concept preservation for IP reimagination requests (new) ---
-    # Users often want "the essence/vibe of X but as if made by Y".
-    # Naming the IP (Zelda + Nintendo, etc.) almost always gets blocked upstream.
-    # We detect the pattern and rewrite to pure concept before any enhancers.
     if _is_reimagination_request(p) and not is_edit:
         rewritten = _rewrite_to_concept_essence(p)
         if rewritten and rewritten != p:
             p = rewritten
             lower = _strip_accents(p.lower())
 
-    # Detect dominant Spanish to decide enhancer strategy
-    spanish_score = sum(1 for marker in (" el ", " la ", " de ", " una ", " con ", " para ", " que ") if marker in " " + lower + " ")
-    looks_spanish = spanish_score >= 1 or any(ch in p for ch in "áéíóúñü¿¡")
+    wants_photo = any(
+        k in lower
+        for k in (
+            "photo", "photograph", "photoreal", "realistic", "realista",
+            "realism", "35mm", "camera", "live action", "live-action",
+            "real person", "real people", "cinematic still", "promo poster",
+            "screenshot", "foto",
+        )
+    )
+    wants_art = any(
+        k in lower
+        for k in (
+            "anime", "waifu", "manga", "chibi", "cartoon", "sticker",
+            "comic", "illustration", "painting", "drawing", "ink wash",
+            "ilustracion",
+        )
+    )
 
-    enhancers: list[str] = []
-
-    # Style detection (common user requests)
-    if any(k in lower for k in ("gótica", "goth", "gotica", "dark", "negra", "oscura", "vampira")):
-        enhancers.append("gothic style, dramatic chiaroscuro lighting, moody atmosphere")
-    elif any(k in lower for k in ("cyberpunk", "neon", "futurista", "sci-fi", "cyber")):
-        enhancers.append("cyberpunk aesthetic, vibrant neon lighting, cinematic")
-    elif any(k in lower for k in ("anime", "waifu", "manga", "chibi")):
-        enhancers.append("detailed anime style, vibrant colors, clean lines")
-    elif any(k in lower for k in ("realista", "photoreal", "foto")):
-        enhancers.append("photorealistic, highly detailed, natural lighting")
+    extras: list[str] = []
+    if wants_photo and not wants_art:
+        extras.append(
+            "photoreal live-action photograph, natural skin and fabric, "
+            "real lighting, 35mm, no illustration, no anime, no CGI, no cartoon"
+        )
+    elif wants_art and not wants_photo:
+        extras.append("commit to the requested art style, clean detailed artwork")
     else:
-        # Default artistic boost that works great for fantasy/character requests (the most common)
-        enhancers.append("stylized fantasy illustration, dramatic lighting, rich detail")
+        extras.append("high detail, natural lighting, follow the user's medium")
 
-    # Quality / polish (only if user didn't already ask for it)
-    if not any(q in lower for q in ("detall", "masterpiece", "high quality", "4k", "8k", "cinematic")):
-        enhancers.append("highly detailed, sharp focus, masterpiece composition")
+    if is_edit:
+        extras.append(
+            "preserve identity, face, outfit and pose from the reference unless asked to change them"
+        )
+        extras.append("crop out black bars, letterboxing and phone UI")
 
-    # For very short Spanish prompts, gently expand descriptiveness while keeping voice
-    if looks_spanish and len(p) < 60 and not is_edit:
-        # Common pattern: "chica tetona en bikini gótica" -> keep + enhancers
-        if any(body in lower for body in ("tetona", "culona", "curvy", "busty", "sexy", "voluptuosa")):
-            enhancers.append("expressive pose, beautiful stylized proportions")
+    extras.append("fully clothed, non-sexual")
 
-    # Assemble (user prompt first, then enhancers)
-    if enhancers:
-        enhancer_str = ", ".join(enhancers)
-        # Avoid double comma or style collision
-        if any(w in p.lower() for w in ("style", "ilustración", "render", "lighting", "cinematic")):
-            final = f"{p}, {enhancer_str}"
-        else:
-            final = f"{p}, {enhancer_str}"
-    else:
-        final = p
-
+    final = f"{p}, {', '.join(extras)}"
     final = re.sub(r"\s+", " ", final).strip().strip(",")
-    # Reasonable API length (old behavior preserved)
-    if len(final) > 420:
-        final = final[:417].rstrip() + "..."
-
+    if len(final) > 1200:
+        final = final[:1197].rstrip() + "..."
     return final
 
 

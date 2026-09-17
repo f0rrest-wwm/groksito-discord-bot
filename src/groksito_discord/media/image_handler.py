@@ -437,7 +437,7 @@ async def _tool_generate_image(
         for attempt in range(max_attempts):
             async with httpx.AsyncClient(timeout=settings.api_timeout_seconds) as http_client:
                 generation_payload = {
-                    "model": extra_params.get("model", "grok-imagine-image-quality"),
+                    "model": extra_params.get("model", "grok-imagine-image-2.0"),
                     "prompt": current_prompt,
                     "n": min(count, 4),
                     "response_format": "url",
@@ -641,7 +641,7 @@ async def _resolve_edit_reference_urls(reference_urls: list[str]) -> list[str]:
 def _build_edit_payload(prompt: str, refs: list[str], aspect_ratio: str | None, **extra: Any) -> dict:
     image_entries = [{"url": url, "type": "image_url"} for url in refs]
     payload: dict = {
-        "model": extra.get("model", "grok-imagine-image-quality"),
+        "model": extra.get("model", "grok-imagine-image-2.0"),
         "prompt": prompt,
         "response_format": "url",
     }

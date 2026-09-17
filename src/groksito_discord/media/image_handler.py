@@ -174,66 +174,42 @@ def _rewrite_to_concept_essence(original: str) -> str:
 
 # --- Modern Prompt Engineering (always-on quality pass + Spanish-friendly) ---
 
+_LEAK_PHRASES = (
+    "generate_image",
+    "edit_image",
+    "raid battle poster",
+    "everest raid battle poster",
+    "aspect ratio 9:16",
+    "aspect ratio 16:9",
+    "aspect_ratio",
+    "9:16",
+    "16:9",
+    "fully clothed",
+    "non-sexual",
+    "no extra people",
+    "no other text",
+)
+
+
+def _strip_prompt_leaks(text: str) -> str:
+    """Remove tool/instruction crumbs so Imagine does not paint them as captions."""
+    p = text or ""
+    for phrase in _LEAK_PHRASES:
+        p = re.sub(re.escape(phrase), " ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\s+", " ", p)
+    p = re.sub(r"\s*,\s*,+", ", ", p)
+    return p.strip(" ,")
+
+
 def _enhance_prompt_for_api(original: str, is_edit: bool = False) -> str:
-    """Light rewrite close to grok.com Imagine. Do not force illustration."""
+    """Pass Grok's tool prompt through. Do not restyle, truncate, or force illustration."""
     if not original or len(original.strip()) < 2:
         return original or (
-            "a clear well-lit photograph of the requested subject"
+            "the requested scene, high detail"
             if not is_edit
-            else "keep the subject, apply the requested change only"
+            else "apply the requested change only, keep the subject"
         )
-
-    p = original.strip()
-    lower = _strip_accents(p.lower())
-
-    if _is_reimagination_request(p) and not is_edit:
-        rewritten = _rewrite_to_concept_essence(p)
-        if rewritten and rewritten != p:
-            p = rewritten
-            lower = _strip_accents(p.lower())
-
-    wants_photo = any(
-        k in lower
-        for k in (
-            "photo", "photograph", "photoreal", "realistic", "realista",
-            "realism", "35mm", "camera", "live action", "live-action",
-            "real person", "real people", "cinematic still", "promo poster",
-            "screenshot", "foto",
-        )
-    )
-    wants_art = any(
-        k in lower
-        for k in (
-            "anime", "waifu", "manga", "chibi", "cartoon", "sticker",
-            "comic", "illustration", "painting", "drawing", "ink wash",
-            "ilustracion",
-        )
-    )
-
-    extras: list[str] = []
-    if wants_photo and not wants_art:
-        extras.append(
-            "photoreal live-action photograph, natural skin and fabric, "
-            "real lighting, 35mm, no illustration, no anime, no CGI, no cartoon"
-        )
-    elif wants_art and not wants_photo:
-        extras.append("commit to the requested art style, clean detailed artwork")
-    else:
-        extras.append("high detail, natural lighting, follow the user's medium")
-
-    if is_edit:
-        extras.append(
-            "preserve identity, face, outfit and pose from the reference unless asked to change them"
-        )
-        extras.append("crop out black bars, letterboxing and phone UI")
-
-    extras.append("fully clothed, non-sexual")
-
-    final = f"{p}, {', '.join(extras)}"
-    final = re.sub(r"\s+", " ", final).strip().strip(",")
-    if len(final) > 1200:
-        final = final[:1197].rstrip() + "..."
-    return final
+    return _strip_prompt_leaks(original.strip())
 
 
 # --- Safety softening (only for 422/policy retries - invisible to user) ---

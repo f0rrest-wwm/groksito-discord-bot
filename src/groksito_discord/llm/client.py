@@ -138,7 +138,7 @@ def _finalize_response(response: Any, direct_delivery_performed: bool, cid_p: st
     if final_text:
         return final_text.strip()
 
-    return "✅ Groksito procesó tu mensaje usando las herramientas (respuesta vía Responses API)."
+    return "✅ "
 
 
 def _should_offer_light_decision(
@@ -902,11 +902,7 @@ async def call_grok_for_groksito(
             # When attachments provided (even with images), retry path (generalized) gives model metadata chance;
             # do not short-circuit to image-specific canned message.
             logger.warning(f"{cid_p}[LLM][VISION] Failing request had {len(image_urls)} image(s) attached.")
-            return (
-                "Tuve problemas procesando la(s) imagen(es) que enviaste. "
-                "El servicio de visi├│n de Grok est├í teniendo dificultades con este archivo en este momento. "
-                "Por favor, describe lo que ves en la imagen con palabras y te ayudo con eso."
-            )
+            return "Error. <@253869773421674498>, Check logs to fix it."
 
         if attachments:
             logger.warning(f"{cid_p}[LLM][ATTACHMENTS] Failing request had {len(attachments)} attachment(s) (metadata was available on first/retry turn).")
@@ -914,15 +910,15 @@ async def call_grok_for_groksito(
 
         # Lightweight classification for common transient/user-facing cases (after retries exhausted in helper)
         if isinstance(e, (RateLimitError,)) or "rate" in str(e).lower() or "429" in str(e).lower():
-            return "Estoy recibiendo muchas solicitudes ahora mismo (rate limit). Dame un minuto e intenta de nuevo."
+            return "Error. <@253869773421674498>, Check logs to fix it."
         if isinstance(e, (APITimeoutError, APIConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower():
-            return "Tuve un problema de conexi├│n con Grok. Intenta de nuevo en unos segundos."
+            return "Error. <@253869773421674498>, Check logs to fix it."
 
         # Server errors after retries
         if isinstance(e, APIError):
             status = getattr(e, "status_code", None)
             if status and 500 <= status < 600:
-                return "El servicio de Grok est├í teniendo problemas temporales (5xx). Intenta de nuevo en un momento."
+                return "Error. <@253869773421674498>, Check logs to fix it."
             if status in (401, 403):
                 # Common with expired/revoked OAuth or tier gates on the oauth surface
                 hint = ""
@@ -932,9 +928,9 @@ async def call_grok_for_groksito(
                         hint = " (OAuth token may be invalid/expired or tier-restricted ΓÇö try `groksito --login-oauth` or switch to XAI_API_KEY)"
                 except Exception:
                     pass
-                return f"Problema de autenticaci├│n con Grok (401/403).{hint}"
+                return "Error. <@253869773421674498>, Check logs to fix it."
 
-        return f"Lo siento, tuve un problema conectando con Grok: {e}"
+        return "Error. <@253869773421674498>, Check logs to fix it."
 
     # (auth error hints are also emitted by get_grok_bearer / refresh logic and --test-auth)
 

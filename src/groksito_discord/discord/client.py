@@ -547,9 +547,9 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
 
         try:
             await _discord_client.change_presence(activity=discord.Game(name="yapping"))
-          guild = discord.Object(id=1443263158532702373)
+            guild = discord.Object(id=1443263158532702373)
             await tree.sync(guild=guild)
-            logger.info("Γ£à Slash commands synchronized")
+            logger.info("Slash commands synchronized for Everest guild")
         except Exception as e:
             logger.error(f"Error syncing slash commands: {e}")
 
@@ -565,21 +565,6 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             logger.info("[Emoji] Background emote metadata scan launched (vision + usage ranking is lazy on real use)")
         except Exception as emoji_err:
             logger.debug(f"[Emoji] Could not start emote scan (non-fatal): {emoji_err}")
-
-        try:
-            from .integrations import steam as steam_integration
-            asyncio.create_task(steam_integration.warmup_steam_app_list())
-            logger.info("[Steam] Background app list cache warmup launched")
-        except Exception as steam_err:
-            logger.debug(f"[Steam] Could not start app list warmup (non-fatal): {steam_err}")
-
-        # Gamemeca weekly ranking JSON updater (avoids live scrape on every /korea50)
-        try:
-            from .integrations import gamemeca as gamemeca_integration
-            asyncio.create_task(_periodic_gamemeca_ranking_update(gamemeca_integration))
-            logger.info("[Gamemeca] Background weekly ranking JSON updater launched (daily check)")
-        except Exception as gm_err:
-            logger.debug(f"[Gamemeca] Could not start ranking updater (non-fatal): {gm_err}")
 
         try:
             from ..media.daily_motivation import run_loop

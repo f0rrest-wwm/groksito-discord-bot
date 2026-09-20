@@ -987,6 +987,13 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
         except Exception as gm_err:
             logger.debug(f"[Gamemeca] Could not start ranking updater (non-fatal): {gm_err}")
 
+        try:
+            from ..media.daily_motivation import run_loop
+            asyncio.create_task(run_loop(_discord_client))
+            logger.info("[Motivation] Daily 09:00 NPT quote image loop launched")
+        except Exception as mot_err:
+            logger.debug(f"[Motivation] loop not started: {mot_err}")
+
         # Write initial heartbeat + supporting snapshots so the web dashboard has good data immediately.
         try:
             from ..core.health import (

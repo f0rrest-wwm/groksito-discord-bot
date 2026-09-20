@@ -201,7 +201,7 @@ def _guess_filename(url: str, kind: str, index: int = 0) -> str:
     if not ext:
         ext = {"image": "png", "video": "mp4"}.get(kind, "bin")
     suffix = f"_{index + 1}" if index else ""
-    return f"groksito_{kind}{suffix}.{ext}"
+    return f"meepo_{kind}{suffix}.{ext}"
 
 
 async def _download_url(url: str) -> bytes | None:

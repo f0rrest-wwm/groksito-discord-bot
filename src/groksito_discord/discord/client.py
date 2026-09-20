@@ -547,7 +547,8 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
 
         try:
             await _discord_client.change_presence(activity=discord.Game(name="yapping"))
-            await tree.sync()
+          guild = discord.Object(id=1443263158532702373)
+            await tree.sync(guild=guild)
             logger.info("Γ£à Slash commands synchronized")
         except Exception as e:
             logger.error(f"Error syncing slash commands: {e}")

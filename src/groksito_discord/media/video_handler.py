@@ -16,7 +16,7 @@ Key modernizations (following the image pattern):
 - Natural, consistent user-facing messages (matching image delivery style: neutral Spanish captions).
 - Direct delivery via image_delivery (register + consume + reply) for natural "typing..." UX.
 - I2V aspect ratio inferred from the reference image (avoids model guessing 16:9 on portrait/square art).
-- No bot-side daily caps — SuperGrok / xAI subscription limits apply (Grok web parity).
+- Daily per-user video cap (default 5) + single in-flight lock. Owner IDs unlimited.
 - Clean separation of concerns.
 
 Canonical video handler; public dispatch functions keep stable signatures.
@@ -37,6 +37,7 @@ import httpx
 from ..utils.correlation import cid_prefix
 from ..config import settings
 from .delivery import build_video_caption, deliver_from_request, register_image_request
+from . import video_quota
 
 # Bearer (OAuth preferred)
 try:
@@ -630,6 +631,7 @@ async def _handle_generate_video(args: dict, original_message: Any, image_urls: 
     Handles generate_video dispatch.
 
     - Request registration for direct delivery.
+    - Daily quota + one-video-at-a-time lock.
     - Calls the modern _tool_generate_video (with prompt enhancement).
     """
     prompt = args.get("prompt", "")
@@ -640,9 +642,19 @@ async def _handle_generate_video(args: dict, original_message: Any, image_urls: 
 
     source_image_url = image_urls[0] if image_urls else None
 
-    user_id = getattr(getattr(original_message, "author", None), "id", 0)
+    author = getattr(original_message, "author", None)
+    user_id = getattr(author, "id", 0) or 0
+    display_name = (
+        getattr(author, "display_name", None)
+        or getattr(author, "name", None)
+        or ""
+    )
 
-    # Register for direct delivery (reuses image_delivery infrastructure)
+    blocked = video_quota.check_can_start(user_id, display_name)
+    if blocked:
+        logger.info(f"{cid_prefix()}[Video] blocked user={user_id}: {blocked}")
+        return blocked
+
     request_id = None
     try:
         request_id = await register_image_request(
@@ -655,16 +667,24 @@ async def _handle_generate_video(args: dict, original_message: Any, image_urls: 
     except Exception:
         pass
 
-    return await _tool_generate_video(
-        prompt,
-        duration=duration,
-        aspect_ratio=aspect_ratio,
-        request_id=request_id,
-        source_image_url=source_image_url,
-        resolution=resolution,
-        # forward any extra future params the caller might have received
-        **{k: v for k, v in args.items() if k not in ("prompt", "duration", "aspect_ratio", "aspect", "resolution")}
-    )
+    try:
+        result = await _tool_generate_video(
+            prompt,
+            duration=duration,
+            aspect_ratio=aspect_ratio,
+            request_id=request_id,
+            source_image_url=source_image_url,
+            resolution=resolution,
+            **{k: v for k, v in args.items() if k not in ("prompt", "duration", "aspect_ratio", "aspect", "resolution")}
+        )
+        text = result if isinstance(result, str) else ""
+        err = text.lower().startswith("error") or "could not" in text.lower()
+        if text and not err:
+            used = video_quota.mark_success(user_id, display_name)
+            logger.info(f"{cid_prefix()}[Video] quota user={user_id} used={used}/{video_quota.DAILY_LIMIT}")
+        return result
+    finally:
+        video_quota.release_lock()
 
 
 # Lazy module-level re-export for DIRECT_* (test_guidance_centralization).

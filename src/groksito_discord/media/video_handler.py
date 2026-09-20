@@ -650,6 +650,10 @@ async def _handle_generate_video(args: dict, original_message: Any, image_urls: 
         or ""
     )
 
+    if video_quota.is_nsfw_request(prompt):
+        logger.info(f"{cid_prefix()}[Video] NSFW blocked user={user_id}")
+        return video_quota.NSFW_REPLY
+
     blocked = video_quota.check_can_start(user_id, display_name)
     if blocked:
         logger.info(f"{cid_prefix()}[Video] blocked user={user_id}: {blocked}")

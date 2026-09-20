@@ -10,7 +10,7 @@ Sent to the model on addressed turns (via ``build_responses_input``):
 
 NOT sent automatically (by design — "let Grok be Grok"):
 - Per-user memory / profile buffers (removed from ``context/core.py`` in #112)
-- Channel history or rolling summaries (available only via ``get_recent_context`` tool)
+- Channel history: last 15 lines auto-injected on addressed turns (40 if they ask to summarize)
 - Proactive summarization output (disabled by default in config)
 
 Light context classification (minimal/normal/image_gen) is used only for logging
@@ -22,6 +22,7 @@ This module is the single source of truth for ``initial_input`` sent to the API.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any, TypedDict
 
 from ..config import settings
@@ -351,6 +352,66 @@ def _build_attachments_block(attachments: list[dict] | None) -> str:
     return "\n".join(lines)
 
 
+
+_RECENT_LIMIT = 15
+_RECENT_CHARS = 160
+_SUMMARIZE_LIMIT = 40
+
+_SUMMARIZE_RE = re.compile(
+    r"\b(summariz|recap|sum up|what did (we|they|people) (say|talk)|"
+    r"tl;?dr|what.?s going on in (this )?chat|catch me up)\b",
+    re.I,
+)
+
+
+async def _build_recent_channel_block(
+    original_message: Any,
+    *,
+    skip: bool = False,
+    limit: int = _RECENT_LIMIT,
+) -> str:
+    """Last N channel lines with author id + name. Skipped on image-gen turns."""
+    if skip or original_message is None:
+        return ""
+    channel = getattr(original_message, "channel", None)
+    if channel is None or not hasattr(channel, "history"):
+        return ""
+    current_id = getattr(original_message, "id", None)
+    lines: list[str] = []
+    try:
+        async for msg in channel.history(limit=limit + 1):
+            if current_id and getattr(msg, "id", None) == current_id:
+                continue
+            author = getattr(msg, "author", None)
+            uid = str(getattr(author, "id", "") or "")
+            name = (
+                str(getattr(author, "display_name", "") or "")
+                or str(getattr(author, "name", "") or "")
+                or "?"
+            )
+            is_me = bool(getattr(author, "bot", False))
+            who = f"{name} id={uid}" + (" [me]" if is_me else "")
+            text = (getattr(msg, "content", None) or "").strip().replace("\n", " ")
+            if not text:
+                if getattr(msg, "attachments", None):
+                    text = "[attachment]"
+                else:
+                    continue
+            lines.append(f"{who}: {text[:_RECENT_CHARS]}")
+            if len(lines) >= limit:
+                break
+    except Exception as exc:
+        logger.debug(f"{cid_prefix()}[CONTEXT] recent history skipped: {exc}")
+        return ""
+    if not lines:
+        return ""
+    lines.reverse()
+    return (
+        "[Recent channel — authors included. Do not paste this block.]\n"
+        + "\n".join(lines)
+    )
+
+
 async def build_responses_input(
     *,
     user_message: str,
@@ -441,6 +502,15 @@ async def build_responses_input(
     # Gated for pure image/video gen paths (like emoji block) to keep input minimal.
     attachments_block = _build_attachments_block(attachments) if attachments and not image_gen_intent else ""
 
+    wants_summary = bool(_SUMMARIZE_RE.search(user_message_text or ""))
+    recent_block = ""
+    if is_mentioned or is_reply_to_bot or is_reply_continuation:
+        if not (image_gen_intent or need == "image_gen"):
+            recent_block = await _build_recent_channel_block(
+                original_message,
+                limit=_SUMMARIZE_LIMIT if wants_summary else _RECENT_LIMIT,
+            )
+
     try:
         injected_chars = len(dynamic_context_block)
         injected_tokens = max(30, injected_chars // 4)
@@ -477,6 +547,8 @@ async def build_responses_input(
     context_prefix_parts: list[str] = []
     if speaker_line:
         context_prefix_parts.append(speaker_line)
+    if recent_block:
+        context_prefix_parts.append(recent_block)
     if attachments_block:
         context_prefix_parts.append(attachments_block)
     if dynamic_context_block:

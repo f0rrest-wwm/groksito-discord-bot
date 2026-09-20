@@ -142,3 +142,19 @@ def snapshot():
         data["unlimited"] = sorted(_unlimited_ids())
         data["daily_limit"] = DAILY_LIMIT
         return data
+
+
+def status_message(user_id, display_name: str = "") -> str:
+    uid = str(user_id)
+    used = used_today(uid)
+    limit = DAILY_LIMIT
+    if is_unlimited(uid):
+        return (
+            f"Video quota for {display_name or uid}: unlimited "
+            f"(creator). Reset is UTC midnight. Limit for others: {limit}/day."
+        )
+    left = max(0, limit - used)
+    return (
+        f"Video quota for {display_name or uid}: {used}/{limit} used today, "
+        f"{left} left. Resets at UTC midnight."
+    )

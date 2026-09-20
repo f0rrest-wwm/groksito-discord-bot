@@ -18,7 +18,7 @@ Important invariants (do not break):
 - Guild whitelist checked in both on_message and every slash command.
 - Rate limit check happens *before* invoking the LLM path.
 - Context (short-term channel history) is always updated for *every* message.
-- Strict activation policy: only @mentions or direct replies to Groksito messages.
+- Activation: @mentions, bare name (meepo/groksito), or direct replies to the bot.
 - Direct media delivery uses the DIRECT_DELIVERY_PERFORMED sentinel
   (cooperates with media/delivery.py + llm/client.py for exactly one reply).
 - Background heartbeat task keeps the web UI informed of connection status.
@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import defaultdict, deque
 from typing import Any, Deque, Optional
@@ -1175,10 +1176,13 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             # (e.g. " @groksito describe the video in that link my friend just posted").
 
             is_mentioned = _discord_client.user in getattr(message, "mentions", [])
+            raw_low = (message.content or "").lower()
+            name_called = bool(re.search(r"(?<!\w)(meepo|groksito)(?!\w)", raw_low))
+            if name_called:
+                is_mentioned = True
 
-            # === STRICT ACTIVATION GUARD ===
-            # Only @mention or direct reply to a Groksito message. User-to-user replies
-            # (even with images, videos, or "groksito" in text) must never wake the bot.
+            # === ACTIVATION GUARD ===
+            # @mention, bare name (meepo / groksito), or direct reply to the bot.
             if not is_mentioned and not is_reply_to_bot:
                 return
 

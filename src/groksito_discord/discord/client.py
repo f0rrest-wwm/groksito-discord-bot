@@ -506,6 +506,7 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
     intents.guilds = True
     intents.members = True
     intents.message_content = True  # Required for conversational bot
+    intents.voice_states = True
 
     _discord_client = discord.Client(intents=intents)
 
@@ -795,6 +796,15 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             # @mention, bare name (meepo / groksito), or direct reply to the bot.
             if not is_mentioned and not is_reply_to_bot:
                 return
+
+            try:
+                from ..media.voice_channel import is_voice_control, handle_voice_command
+                if is_voice_control(message.content or ""):
+                    handled = await handle_voice_command(message)
+                    if handled:
+                        return
+            except Exception as vc_err:
+                logger.warning(f"{cid_p}[Voice] {vc_err}")
 
             # Rate limit
             rl = getattr(_discord_client, "rate_limiter", rate_limiter)

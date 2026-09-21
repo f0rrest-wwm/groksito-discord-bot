@@ -212,7 +212,9 @@ _EXPAND_SYSTEM = (
     "Match their style: photograph vs illustration vs cinematic game key art. "
     "If they say poster or key art, use AAA cinematic launch-key-art, realistic materials, "
     "deep contrast — not a bright cute gacha banner and not a four-legged chibi mascot unless they asked for that. "
-    "Keep everyone fully clothed. No nudes."
+    "Keep everyone fully clothed. No nudes. "
+    "If the request is Meepo's boss, creator, owner, or maker: depict f0rest, "
+    "a Wuxia guild leader OC. Never Elon Musk, never xAI branding, never Grok logos."
 )
 
 
@@ -261,6 +263,65 @@ async def _expand_like_website(user_text: str) -> str:
         logger.warning(f"{cid_prefix()}[Image] expand exception: {exc}")
         return raw
 
+
+
+_CREATOR_OC = (
+    "original character named f0rest, young Wuxia / Where Winds Meet guild leader of Everest, "
+    "East Asian-inspired adventurer in layered travel robes and light armor, confident stance, "
+    "mountain wind, lantern light, NOT a celebrity, NOT Elon Musk, NOT a tech CEO, "
+    "no Tesla, no xAI logo, no Grok branding, no suit in a glass office"
+)
+
+_BOSS_TRIGGER = (
+    "your boss", "your creator", "your owner", "your maker", "who made you",
+    "who created you", "image of your boss", "image of your creator",
+    "picture of your boss", "picture of your creator", "foto de tu jefe",
+    "tu creador", "tu jefe", "my boss meepo", "meepo boss", "meepo creator",
+)
+
+_ELON_BITS = (
+    "elon musk", "elon", "musk", "tesla ceo", "spacex", "xai office",
+    "xai logo", "understand the universe", "grok ai", "neural network training cluster",
+)
+
+
+def _is_boss_or_creator_request(text: str) -> bool:
+    t = (text or "").lower()
+    if any(k in t for k in _BOSS_TRIGGER):
+        return True
+    if any(k in t for k in ("boss", "creator", "owner", "maker")) and any(
+        k in t for k in ("your", "meepo", "bot")
+    ):
+        return True
+    return False
+
+
+def _strip_elon(text: str) -> str:
+    p = text or ""
+    for bit in _ELON_BITS:
+        p = re.sub(re.escape(bit), " ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\bxAI\b", " ", p, flags=re.IGNORECASE)
+    p = re.sub(r"\s+", " ", p).strip(" ,")
+    return p
+
+
+def _rewrite_creator_boss_prompt(original: str) -> str:
+    """Force boss/creator images away from Elon / xAI and onto f0rest OC."""
+    raw = original or ""
+    if not _is_boss_or_creator_request(raw) and not any(
+        b in raw.lower() for b in ("elon", "musk")
+    ):
+        return raw
+    if _is_boss_or_creator_request(raw) or (
+        any(b in raw.lower() for b in ("elon", "musk", "xai"))
+        and any(k in raw.lower() for k in ("boss", "creator", "owner", "maker"))
+    ):
+        return (
+            f"{_CREATOR_OC}. Cinematic portrait, detailed face that is NOT Elon Musk, "
+            "not balding celebrity, original face only. "
+            f"User request context (do not depict named CEOs): {_strip_elon(raw)[:240]}"
+        )
+    return _strip_elon(raw)
 
 def _enhance_prompt_for_api(original: str, is_edit: bool = False) -> str:
     """Do not restyle. Only strip tool crumbs. Expansion happens in _expand_like_website."""
@@ -424,8 +485,13 @@ async def _tool_generate_image(
         return "No xAI credential configured for image generation (run --login-oauth or set XAI_API_KEY)."
 
     requested_prompt = (user_caption_source or prompt or "").strip() or prompt
+    requested_prompt = _rewrite_creator_boss_prompt(requested_prompt)
     expanded = await _expand_like_website(requested_prompt)
+    expanded = _rewrite_creator_boss_prompt(expanded)
     current_prompt = _enhance_prompt_for_api(expanded, is_edit=False)
+    current_prompt = _strip_elon(current_prompt)
+    if _is_boss_or_creator_request(prompt or "") or _is_boss_or_creator_request(user_caption_source or ""):
+        current_prompt = _rewrite_creator_boss_prompt(current_prompt)
     seed = requested_prompt.lower()
     if not aspect_ratio and re.search(r"9\s*[:x]\s*16|portrait|phone poster|key art", seed):
         aspect_ratio = "9:16"
@@ -716,8 +782,11 @@ async def _tool_edit_image(
     refs = (reference_urls or [])[:3]
     refs = await _resolve_edit_reference_urls(refs)
     seed = (user_caption_source or prompt or "").strip() or prompt
+    seed = _rewrite_creator_boss_prompt(seed)
     expanded = await _expand_like_website(seed)
+    expanded = _rewrite_creator_boss_prompt(expanded)
     enhanced_prompt = _enhance_prompt_for_api(expanded, is_edit=True)
+    enhanced_prompt = _strip_elon(enhanced_prompt)
     low = seed.lower()
     if not aspect_ratio and re.search(r"9\s*[:x]\s*16|portrait|phone poster|key art", low):
         aspect_ratio = "9:16"

@@ -75,17 +75,32 @@ async def join(member: Any) -> str:
     if channel is None:
         return "Join a voice channel first, then ask me to join."
 
-    perms = channel.permissions_for(channel.guild.me)
-    if not perms.connect or not perms.speak:
-        return "I need Connect + Speak in that voice channel."
-
     if _vc and _vc.is_connected():
         if _vc.channel and _vc.channel.id == channel.id:
             return f"Already in {channel.name}."
-        await _vc.move_to(channel)
-        return f"Moved to {channel.name}."
+        try:
+            await _vc.move_to(channel)
+            return f"Moved to {channel.name}."
+        except discord.Forbidden:
+            return (
+                f"Discord refused move into #{channel.name}. "
+                "Channel overwrite is denying Connect or Speak for Meepo."
+            )
 
-    _vc = await channel.connect(self_deaf=True, reconnect=True)
+    try:
+        _vc = await channel.connect(self_deaf=True, reconnect=True)
+    except discord.ClientException as exc:
+        logger.warning("vc connect ClientException: %s", exc)
+        return f"Could not join: {exc}"
+    except discord.Forbidden:
+        return (
+            f"Discord refused Connect/Speak in #{channel.name}. "
+            "Fix the CHANNEL permission overwrite for Meepo (not only the role): "
+            "Connect = on, Speak = on, remove any red X. Then kick and reinvite Meepo."
+        )
+    except Exception as exc:
+        logger.exception("vc connect failed")
+        return f"Join failed: {type(exc).__name__}: {exc}"
     return f"Joined {channel.name}. Say `@Meepo say in vc hello` and I will talk there."
 
 

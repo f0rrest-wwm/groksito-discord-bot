@@ -112,7 +112,6 @@ async def join(member: Any) -> str:
         return "Join a voice channel first, then ask me to join."
     _loop = asyncio.get_running_loop()
 
-    cls = _recv_cls()
     if _vc and _vc.is_connected():
         if _vc.channel and _vc.channel.id == channel.id:
             return f"Already in {channel.name}."
@@ -123,10 +122,9 @@ async def join(member: Any) -> str:
             return f"Discord refused move into #{channel.name}."
 
     try:
-        kwargs = {"self_deaf": not _listen_on, "reconnect": True}
-        if cls:
-            kwargs["cls"] = cls
-        _vc = await channel.connect(**kwargs)
+        # Speak-only client. VoiceRecvClient starts a packet router that
+        # crashes on DAVE-encrypted incoming audio (OpusError: corrupted stream).
+        _vc = await channel.connect(self_deaf=True, reconnect=True)
     except discord.ClientException as exc:
         return f"Could not join: {exc}"
     except discord.Forbidden:
@@ -365,11 +363,26 @@ async def start_listen(member: Any) -> str:
         msg = await join(member)
         if not _vc or not _vc.is_connected():
             return msg
-    if not hasattr(_vc, "listen"):
+    cls = _recv_cls()
+    if cls is None:
         return (
             "Voice receive library missing. Add `discord-ext-voice-recv` to requirements.txt "
             "and redeploy."
         )
+    if not hasattr(_vc, "listen"):
+        channel = _vc.channel
+        try:
+            await _vc.disconnect(force=True)
+        except Exception:
+            pass
+        try:
+            _vc = await channel.connect(cls=cls, self_deaf=False, reconnect=True)
+        except Exception as exc:
+            return (
+                f"Could not enable listen ({exc}). "
+                "Discord DAVE encryption often breaks incoming decode. "
+                "Speak-in-VC still works without listen."
+            )
     if _listen_on and getattr(_vc, "is_listening", lambda: False)():
         return "Already listening. Say Meepo then your question."
     try:

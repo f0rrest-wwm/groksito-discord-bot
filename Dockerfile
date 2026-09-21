@@ -44,8 +44,10 @@ LABEL org.opencontainers.image.title="groksito-discord-bot" \
 
 # System dependencies required only by the bot:
 # - ffmpeg: audio (pydub) and video handling
+# - git: required by pip to install git-based requirements (e.g. discord-ext-voice-recv)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
+        git \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy packaging metadata + requirements first for better layer caching

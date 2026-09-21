@@ -676,6 +676,30 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
             if message.author.id == _discord_client.user.id:
                 return
 
+            OWNER_ID = 253869773421674498
+            if message.guild is None:
+                if message.author.id != OWNER_ID:
+                    try:
+                        owner = _discord_client.get_user(OWNER_ID) or await _discord_client.fetch_user(OWNER_ID)
+                        who = getattr(message.author, "display_name", None) or message.author.name
+                        handle = str(message.author)
+                        text = (message.content or "").strip() or "(no text)"
+                        extra = ""
+                        atts = getattr(message.attachments, "__iter__", None)
+                        if message.attachments:
+                            extra = "\nAttachments: " + ", ".join(
+                                getattr(a, "url", "?") for a in message.attachments[:4]
+                            )
+                        await owner.send(
+                            f"Someone DMed Meepo.\n"
+                            f"Name: {who} ({handle})\n"
+                            f"ID: `{message.author.id}`\n"
+                            f"Said: {text[:1800]}{extra}"
+                        )
+                    except Exception as dm_err:
+                        logger.warning(f"Owner DM notify failed: {dm_err}")
+                    return
+
             author_display = getattr(message.author, "display_name", None) or getattr(message.author, "name", "Usuario")
 
             # Generate correlation ID for this message (for full-trace logging of the interaction).

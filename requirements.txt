@@ -34,6 +34,7 @@ rich>=13.7.0
 discord.py[voice]>=2.7.1
 PyNaCl>=1.5.0
 davey>=0.1.6
+discord-ext-voice-recv>=0.5.0
 
 # Note: All image/video generation, vision, memory, and tool logic is self-contained.
 # No FastMCP, no server frameworks, no Spotify dependencies.

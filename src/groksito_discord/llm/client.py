@@ -69,6 +69,19 @@ except Exception:
 
 logger = logging.getLogger("groksito.llm")
 
+
+def _is_policy_denied(err: BaseException) -> bool:
+    """xAI content/policy 403 — not a dead OAuth token."""
+    status = getattr(err, "status_code", None)
+    text = str(err).lower()
+    if "can't help with that request" in text or "permission-denied" in text:
+        return True
+    if status == 403 and "expired" not in text and "unauthor" not in text:
+        return True
+    return False
+
+
+
 # =============================================================================
 # previous_response_id Multi-Turn Contract
 # =============================================================================
@@ -764,10 +777,64 @@ async def call_grok_for_groksito(
         except Exception as api_err:
             is_404 = is_image_fetch_404_error(api_err, has_images=bool(image_urls))
             has_media = bool(image_urls) or bool(attachments)
-            if is_404 or has_media:
-                # Generalized retry path (Task 4): 404 for images OR any trouble when attachments (or image_urls) present.
-                # Rebuild with image_urls=[] but attachments kept (metadata injected for GIFs, PDFs, text files, unsupported images etc).
-                # This gives the model a chance via the attachments block instead of hard fail/canned.
+            cache_key = _get_prompt_cache_key(original_message)
+
+            async def _retry_first_turn(
+                *,
+                retry_images: list,
+                retry_attachments: list | None,
+                retry_ref: dict | None,
+                retry_chain: list | None,
+                retry_reply_cont: bool,
+                label: str,
+            ):
+                rebuilt = await build_responses_input(
+                    user_message=user_message,
+                    channel_id=channel_id,
+                    original_message=original_message,
+                    image_urls=retry_images,
+                    attachments=retry_attachments,
+                    referenced_context=retry_ref,
+                    reply_chain_contexts=retry_chain,
+                    is_reply_continuation=retry_reply_cont,
+                    has_x_link_intent=has_x_link_intent,
+                    image_gen_intent=pure_image_gen_intent or pure_video_gen_intent,
+                    is_reply_to_bot=False,
+                    is_mentioned=is_mentioned,
+                )
+                logger.warning(f"{cid_p}[LLM] {label}")
+                return await _call_responses_with_retry(
+                    client,
+                    model=model,
+                    input=rebuilt["initial_input"],
+                    tools=[*native_search_tools, *custom_tools],
+                    extra_body={"prompt_cache_key": cache_key},
+                )
+
+            if _is_policy_denied(api_err):
+                logger.warning(
+                    f"{cid_p}[LLM][POLICY] First turn denied ({api_err}). "
+                    "Retrying stripped (no media, no reply context)."
+                )
+                try:
+                    response = await _retry_first_turn(
+                        retry_images=[],
+                        retry_attachments=[],
+                        retry_ref=None,
+                        retry_chain=None,
+                        retry_reply_cont=False,
+                        label="[POLICY] stripped retry",
+                    )
+                    image_urls = []
+                    attachments = []
+                    referenced_context = None
+                    reply_chain_contexts = None
+                    logger.info(f"{cid_p}[LLM][POLICY] Stripped retry succeeded.")
+                except Exception as policy_retry_err:
+                    logger.error(f"{cid_p}[LLM][POLICY] Stripped retry failed: {policy_retry_err}")
+                    raise
+
+            elif is_404 or has_media:
                 if is_404:
                     logger.warning(
                         f"{cid_p}[LLM][VISION] Image fetch 404 from xAI backend for {len(image_urls or [])} provided URL(s). "
@@ -781,39 +848,18 @@ async def call_grok_for_groksito(
                         f"Retrying with image_urls cleared but attachments kept so model receives metadata."
                     )
                 try:
-                    # Rebuild via the single authoritative build_responses_input.
-                    # Preserve attachments for metadata; clear only vision urls.
-                    plain_input_data = await build_responses_input(
-                        user_message=user_message,
-                        channel_id=channel_id,
-                        original_message=original_message,
-                        image_urls=[],
-                        attachments=attachments,
-                        referenced_context=referenced_context,
-                        reply_chain_contexts=reply_chain_contexts,
-                        is_reply_continuation=is_reply_continuation,
-                        has_x_link_intent=has_x_link_intent,
-                        image_gen_intent=pure_image_gen_intent or pure_video_gen_intent,
-                        is_reply_to_bot=is_reply_to_bot,
-                        is_mentioned=is_mentioned,
+                    response = await _retry_first_turn(
+                        retry_images=[],
+                        retry_attachments=attachments,
+                        retry_ref=referenced_context,
+                        retry_chain=reply_chain_contexts,
+                        retry_reply_cont=is_reply_continuation,
+                        label="[ATTACHMENTS] retry images cleared",
                     )
-                    plain_initial_input = plain_input_data["initial_input"]
-                    response = await _call_responses_with_retry(
-                        client,
-                        model=model,
-                        input=plain_initial_input,
-                        tools=[
-                            *native_search_tools,
-                            *custom_tools,
-                        ],
-                        extra_body={"prompt_cache_key": cache_key},
-                    )
-                    # Success on retry: clear ONLY vision urls. Metadata from attachments is already in the rebuilt input.
                     image_urls = []
                     logger.info(f"{cid_p}[LLM][ATTACHMENTS] First-turn retry with attachments (images cleared) succeeded.")
                 except Exception as retry_err:
                     logger.error(f"{cid_p}[LLM][ATTACHMENTS] Retry without images also failed: {retry_err}")
-                    # Raise (will reach outer except); we guard canned message when attachments present (model had metadata chance on retry).
                     raise
             else:
                 raise
@@ -897,37 +943,26 @@ async def call_grok_for_groksito(
     except Exception as e:
         logger.exception(f"{cid_p}Error during real Responses API call + tool loop")
 
+        if _is_policy_denied(e):
+            return "Can't do that request."
+
         if image_urls and not attachments:
-            # Guard: only use legacy vision canned when no attachments metadata present.
-            # When attachments provided (even with images), retry path (generalized) gives model metadata chance;
-            # do not short-circuit to image-specific canned message.
             logger.warning(f"{cid_p}[LLM][VISION] Failing request had {len(image_urls)} image(s) attached.")
             return "Error. <@253869773421674498>, Check logs to fix it."
 
         if attachments:
-            logger.warning(f"{cid_p}[LLM][ATTACHMENTS] Failing request had {len(attachments)} attachment(s) (metadata was available on first/retry turn).")
-            # Fall through: use generic classification + final message below (more generic than vision canned).
+            logger.warning(f"{cid_p}[LLM][ATTACHMENTS] Failing request had {len(attachments)} attachment(s).")
 
-        # Lightweight classification for common transient/user-facing cases (after retries exhausted in helper)
         if isinstance(e, (RateLimitError,)) or "rate" in str(e).lower() or "429" in str(e).lower():
             return "Error. <@253869773421674498>, Check logs to fix it."
         if isinstance(e, (APITimeoutError, APIConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower():
             return "Error. <@253869773421674498>, Check logs to fix it."
 
-        # Server errors after retries
         if isinstance(e, APIError):
             status = getattr(e, "status_code", None)
             if status and 500 <= status < 600:
                 return "Error. <@253869773421674498>, Check logs to fix it."
-            if status in (401, 403):
-                # Common with expired/revoked OAuth or tier gates on the oauth surface
-                hint = ""
-                try:
-                    from ..core.grok_oauth import get_grok_bearer
-                    if settings.auth_prefers_oauth or settings.using_oauth:
-                        hint = " (OAuth token may be invalid/expired or tier-restricted ΓÇö try `groksito --login-oauth` or switch to XAI_API_KEY)"
-                except Exception:
-                    pass
+            if status == 401:
                 return "Error. <@253869773421674498>, Check logs to fix it."
 
         return "Error. <@253869773421674498>, Check logs to fix it."

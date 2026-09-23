@@ -63,6 +63,36 @@ tools_logger = logging.getLogger("groksito.tools")  # dedicated for structured t
 ASSET_RESOLVER_TOOLS = frozenset({"get_user_avatar", "get_top_server_emoji"})
 
 
+DISCORD_CONTENT_LIMIT = 1900
+
+
+def _chunk_discord_text(text: str, limit: int = DISCORD_CONTENT_LIMIT) -> list[str]:
+    """Split text so each piece fits Discord's 2000-char message cap."""
+    text = text or ""
+    if len(text) <= limit:
+        return [text] if text else [""]
+    chunks: list[str] = []
+    rest = text
+    while rest:
+        if len(rest) <= limit:
+            chunks.append(rest)
+            break
+        cut = rest.rfind("\n", 0, limit)
+        if cut < limit // 3:
+            cut = rest.rfind(" ", 0, limit)
+        if cut < limit // 3:
+            cut = limit
+        piece = rest[:cut].rstrip()
+        if not piece:
+            piece = rest[:limit]
+            cut = limit
+        chunks.append(piece)
+        rest = rest[cut:].lstrip()
+    return [c for c in chunks if c]
+
+
+
+
 # =============================================================================
 # Tool Schemas (simplified but functional set for the conversational bot)
 # =============================================================================
@@ -161,10 +191,17 @@ async def execute_hybrid_tool(
                 except Exception as emoji_norm_err:
                     tools_logger.debug(f"[Emoji] reply_to_user normalization skipped (non-fatal): {emoji_norm_err}")
 
-                await original_message.reply(content, mention_author=False)
+                pieces = _chunk_discord_text(str(content or ""))
+                if not pieces:
+                    pieces = ["."]
+                await original_message.reply(pieces[0], mention_author=False)
+                channel = getattr(original_message, "channel", None)
+                for extra in pieces[1:]:
+                    if channel is not None:
+                        await channel.send(extra)
                 # Log bot utterance (for buffer / optional summary / legacy completeness).
                 try:
-                    ch = getattr(original_message, "channel", None)
+                    ch = channel
                     ch_id = getattr(ch, "id", None) if ch else None
                     if ch_id:
                         from . import context as ctx
@@ -172,7 +209,7 @@ async def execute_hybrid_tool(
                             channel_id=ch_id,
                             user_id=0,
                             author_name="Groksito",
-                            content=content or "",
+                            content=(content or "")[:1900],
                             is_bot=True,
                         )
                 except Exception:

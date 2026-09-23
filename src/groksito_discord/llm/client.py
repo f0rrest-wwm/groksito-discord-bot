@@ -588,7 +588,7 @@ async def _execute_tool_loop(
                     *continuation_native_search_tools,
                     *continuation_tools,
                 ],
-                extra_body={"prompt_cache_key": cache_key},
+                extra_body={"prompt_cache_key": cache_key, "reasoning": {"effort": "medium"}},
             )
         except Exception as continue_err:
             logger.warning(
@@ -772,7 +772,7 @@ async def call_grok_for_groksito(
                     *native_search_tools,
                     *custom_tools,
                 ],
-                extra_body={"prompt_cache_key": cache_key},
+                extra_body={"prompt_cache_key": cache_key, "reasoning": {"effort": "medium"}},
             )
         except Exception as api_err:
             is_404 = is_image_fetch_404_error(api_err, has_images=bool(image_urls))
@@ -808,7 +808,7 @@ async def call_grok_for_groksito(
                     model=model,
                     input=rebuilt["initial_input"],
                     tools=[*native_search_tools, *custom_tools],
-                    extra_body={"prompt_cache_key": cache_key},
+                    extra_body={"prompt_cache_key": cache_key, "reasoning": {"effort": "medium"}},
                 )
 
             if _is_policy_denied(api_err):

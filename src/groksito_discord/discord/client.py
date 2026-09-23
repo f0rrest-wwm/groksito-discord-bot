@@ -1,929 +1,979 @@
 """
-Discord Client + Connection Ownership for Groksito (Standalone Conversational Bot)
+LLM / Responses API layer for Groksito (standalone).
 
-This module is the sole owner of the persistent Discord Gateway WebSocket
-connection for the conversational @Groksito experience.
+Clean modular orchestrator:
+- Input construction lives exclusively in llm_input.py (single source of truth)
+- Helpers in llm_utils.py
+- This file focuses on call flow, multi-round tool execution, and orchestration.
 
-Key responsibilities:
-- Singleton Discord client + Gateway connection
-- Guild whitelist enforcement (early security gate)
-- Per-user rate limiting (6 requests / 60s)
-- Thin on_message orchestration (activation, context update, then delegate)
-- Slash command registration
-- Wiring to conversation.py + LLM stack (no custom memory; no automatic injection)
-- Liveness heartbeats for the independent web dashboard
-
-Important invariants (do not break):
-- This process is the *only* owner of the Discord Gateway for conversation.
-- Guild whitelist checked in both on_message and every slash command.
-- Rate limit check happens *before* invoking the LLM path.
-- Context (short-term channel history) is always updated for *every* message.
-- Activation: @mentions, bare name (meepo/groksito), or direct replies to the bot.
-- Direct media delivery uses the DIRECT_DELIVERY_PERFORMED sentinel
-  (cooperates with media/delivery.py + llm/client.py for exactly one reply).
-- Background heartbeat task keeps the web UI informed of connection status.
+Public API preserved for compatibility:
+- call_grok_for_groksito (and alias call_grok_with_tools)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-import re
+import os
 import time
-from collections import defaultdict, deque
-from typing import Any, Deque, Optional
+from typing import Any, Optional
 
-from ..utils.correlation import (
-    cid_prefix,
-    generate_correlation_id,
-    set_correlation_id,
-)
-from ..utils.errors import log_auxiliary_failure
+from ..utils.correlation import cid_prefix
+from ..utils.errors import format_tool_execution_error, is_image_fetch_404_error
 
-import discord
-
-# Suppress voice-related warnings (voice is intentionally unsupported).
-try:
-    from discord.voice_client import VoiceClient as _DiscordVoiceClient
-    _DiscordVoiceClient.warn_nacl = False
-    _DiscordVoiceClient.warn_dave = False
-except Exception:
-    pass
+from openai import AsyncOpenAI, RateLimitError, APITimeoutError, APIConnectionError, APIError
 
 from ..config import settings
-from ..core.safety import safe_reply as _safe_reply
-
-# Steam + Twitch integrations (extracted for client hygiene).
-# Data fetching and game resolution live in discord/integrations/.
-from .integrations import gamemeca, steam, thelog, twitch
-
-from ..utils.text import extract_urls_from_text
-
-
-async def _periodic_gamemeca_ranking_update(gamemeca_module):
-    """Background job: refresh Gamemeca ranking JSON ~daily.
-    The page is updated weekly (results reflected next week per site notice).
-    Daily check is safe, cheap, and prevents hitting the site on every user /korea50.
-    Command itself reads from the persisted JSON in data/gamemeca_ranking.json .
-    """
-    # Run once soon after bot start
-    try:
-        await gamemeca_module.refresh_ranking()
-    except Exception as e:
-        logger.debug(f"[Gamemeca] initial refresh failed (non-fatal): {e}")
-
-    while True:
-        await asyncio.sleep(24 * 3600)  # check daily
-        try:
-            await gamemeca_module.refresh_ranking()
-            logger.info("[Gamemeca] ranking JSON refreshed via background job")
-        except Exception as e:
-            logger.warning(f"[Gamemeca] background refresh failed: {e}")
-
-
-# Dedicated /audio slash (reuses 100% of audio_handler.py for TTS + fancy voice delivery
-# via the image_delivery direct-delivery tracker; no duplication of generation or bubble logic).
-from ..media.delivery import register_image_request
-from ..media.audio_handler import (
-    AUDIO_WRAPPING_TAGS,
-    _tool_generate_audio,
-    apply_wrapping_speech_tag,
-    build_audio_speech_tags_embed,
-    prepare_text_from_interaction,
+from ..media.delivery import DIRECT_DELIVERY_PERFORMED
+from .prompt_builder import DIRECT_DELIVERY_DETECTOR_PHRASES
+from .tools import (
+    ASSET_RESOLVER_TOOLS,
+    get_tools_for_request,
+    log_tool_selection,
+    execute_hybrid_tool,
 )
 
-logger = logging.getLogger("groksito.client")
+# For the explicit video intent guard (Python-level safety net in addition to prompt/schema)
+from .media_tools import has_explicit_video_intent, has_explicit_audio_intent
+
+# Import from the new sibling modules (clean separation)
+from .llm_input import build_responses_input
+from ..context import should_offer_light_decision_tools
+from .llm_utils import (
+    _extract_final_text,
+    _build_stub_response,
+    _get_prompt_cache_key,
+    _build_native_search_tools,
+    _detect_visual_intent,
+    _detect_image_creation_intent,
+    is_image_edit_request,
+    _infer_tools_set_name,
+    _extract_and_log_token_usage,
+    _maybe_proactive_summarize,
+    is_pure_image_generation_request,
+    is_pure_video_generation_request,
+    _call_responses_with_retry,
+)
+
+try:
+    from ..config import settings as _settings
+except Exception:
+    _settings = None  # type: ignore
+
+# OAuth / unified bearer support (lazy; central resolver prefers OAuth token when available)
+try:
+    from ..core.grok_oauth import get_grok_bearer as _get_grok_bearer
+except Exception:
+    _get_grok_bearer = None  # type: ignore
+
+logger = logging.getLogger("groksito.llm")
 
 
-# =============================================================================
-# Guild Whitelist Security
-# =============================================================================
-_ALLOWED_GUILD_IDS: set[int] = set(settings.allowed_guild_ids)
-
-
-def is_guild_allowed(guild_id: int | None) -> bool:
-    if not _ALLOWED_GUILD_IDS:
+def _is_policy_denied(err: BaseException) -> bool:
+    """xAI content/policy 403 — not a dead OAuth token."""
+    status = getattr(err, "status_code", None)
+    text = str(err).lower()
+    if "can't help with that request" in text or "permission-denied" in text:
         return True
-    if guild_id is None:
-        return False
-    return guild_id in _ALLOWED_GUILD_IDS
+    if status == 403 and "expired" not in text and "unauthor" not in text:
+        return True
+    return False
 
-
-# =============================================================================
-# Global State
-# =============================================================================
-_discord_client: "discord.Client | None" = None
-_discord_ready = asyncio.Event()
-_discord_task: asyncio.Task | None = None
-
-rate_limiter: Any = None
-tree: Any = None
 
 
 # =============================================================================
-# Rate Limiter
+# previous_response_id Multi-Turn Contract
 # =============================================================================
-# Simple per-user sliding window rate limiter (6 requests per 60 seconds).
-# Enforced in on_message (before LLM invocation) and in /mislimites.
-# This is a basic defense against abuse; the actual heavy lifting for
-# conversational rate limiting and cost control lives in the LLM/tool layer.
-class RateLimiter:
-    def __init__(self, max_requests: int = 6, window_seconds: int = 60):
-        self.max_requests = max_requests
-        self.window = window_seconds
-        self.records: dict[int, Deque[float]] = defaultdict(deque)
+# - Custom tools are minimized on continuations (get_continuation_tools) because
+#   the model retains prior tool declarations via previous_response_id.
+# - Native search re-inclusion is conservative: default [] on continuations;
+#   re-offered only when _should_reoffer_native_search_on_continuation detects
+#   prior-round search activity and no respond_directly/delivery short-circuit.
+# - Vision images are sent only on the first turn of a logical user message;
+#   continuations carry text/tool results only (previous_response_id chains state).
+# - DIRECT_DELIVERY short-circuit must happen before sending tool outputs back
+#   (guarantees no duplicate Discord replies via DIRECT_DELIVERY_PERFORMED).
+# - First-turn `input` (via llm_input.build_responses_input) always uses *exactly one*
+#   system message (the fixed SYSTEM_PROMPT) + a single user message. Light context
+#   notes ([R:] refs + compact emoji header) are folded into the user content on
+#   addressed turns. This design maximizes prompt_cache_key prefix hit rate on the
+#   stable prefix while previous_response_id handles multi-round tool state.
 
-    def check(self, user_id: int) -> tuple[bool, int]:
-        now = time.time()
-        user_records = self.records[user_id]
-        while user_records and now - user_records[0] > self.window:
-            user_records.popleft()
-        used = len(user_records)
-        if used >= self.max_requests:
-            return False, 0
-        user_records.append(now)
-        return True, self.max_requests - used
+MEDIA_ACTION_TOOLS = frozenset({
+    "generate_image",
+    "edit_image",
+    "generate_video",
+    "generate_audio",
+    "reply_to_user",
+})
 
-    def get_remaining(self, user_id: int) -> int:
-        now = time.time()
-        user_records = self.records[user_id]
-        while user_records and now - user_records[0] > self.window:
-            user_records.popleft()
-        return max(0, self.max_requests - len(user_records))
+_MEDIA_DELIVERY_TOOLS = frozenset({
+    "generate_image",
+    "edit_image",
+    "generate_video",
+    "generate_audio",
+})
 
+_CONTINUATION_NO_SEARCH_REOFFER_TOOLS = frozenset({
+    "respond_directly",
+    *MEDIA_ACTION_TOOLS,
+})
 
-# =============================================================================
-# Versus embed builder (/versus)
-# =============================================================================
-_VERSUS_COLORS = (0x3498DB, 0xE74C3C)  # blue vs red
-_VERSUS_EMOJIS = ("🔵", "🔴")
-
-
-def _format_metric(value: int | None, *, suffix: str = "") -> str:
-    if value is None:
-        return "Unavailable"
-    return f"**{value:,}**{suffix}"
+_DIRECT_DELIVERY_SUCCESS_PHRASES = DIRECT_DELIVERY_DETECTOR_PHRASES
 
 
-def _build_versus_embeds(
-    game1_name: str,
-    game2_name: str,
-    steam_games: list[dict[str, Any]],
-    twitch_games: list[dict[str, Any]],
-) -> list[discord.Embed]:
-    """Build header + two side-by-side-style game embeds for /versus."""
-    steam_by_original = {g["original_name"].lower(): g for g in steam_games}
-    twitch_by_original = {g["original_name"].lower(): g for g in twitch_games}
-
-    pairs: list[tuple[str, dict[str, Any] | None, dict[str, Any] | None]] = []
-    for name in (game1_name, game2_name):
-        key = name.lower()
-        pairs.append((name, steam_by_original.get(key), twitch_by_original.get(key)))
-
-    header = discord.Embed(
-        title="⚔️ Versus",
-        description=f"**{game1_name}** vs **{game2_name}**",
-        color=0x9B59B6,
-    )
-    header.set_footer(text="Datos en vivo de Steam y Twitch")
-
-    embeds: list[discord.Embed] = [header]
-
-    for idx, (original, steam_data, twitch_data) in enumerate(pairs):
-        color = _VERSUS_COLORS[idx]
-        emoji = _VERSUS_EMOJIS[idx]
-        display_name = (
-            (steam_data or {}).get("matched_name")
-            or (twitch_data or {}).get("matched_name")
-            or original
+def _is_direct_delivery_success(result_str: str, tool_name: str, cid_p: str) -> bool:
+    """Detect explicit direct-delivery success from media/reply_to_user tool results."""
+    lowered = result_str.lower()
+    if any(phrase in lowered for phrase in _DIRECT_DELIVERY_SUCCESS_PHRASES):
+        logger.info(
+            f"{cid_p}[LLM] Direct delivery SUCCESS for tool '{tool_name}' "
+            "— suppressing final text reply"
         )
+        return True
+    if "policy blocked" in lowered and "clean direct message delivered" in lowered:
+        return True
+    return False
 
-        steam_found = steam_data is not None
-        twitch_found = bool(twitch_data and twitch_data.get("found"))
 
-        if not steam_found and not twitch_found:
-            embeds.append(
-                discord.Embed(
-                    title=f"{emoji} {display_name}",
-                    description="This game was not found on Steam or Twitch.",
-                    color=color,
-                )
-            )
-            continue
+def _finalize_response(response: Any, direct_delivery_performed: bool, cid_p: str) -> str | object:
+    """Extract final text or return DIRECT_DELIVERY_PERFORMED sentinel."""
+    final_text = _extract_final_text(response)
 
-        embed = discord.Embed(
-            title=f"{emoji} {display_name}",
-            color=color,
-            url=(
-                f"https://store.steampowered.com/app/{steam_data['appid']}/"
-                if steam_data and steam_data.get("appid")
-                else None
-            ),
+    if direct_delivery_performed:
+        logger.info(
+            f"{cid_p}[LLM] Direct media/action delivery performed "
+            "— returning DIRECT_DELIVERY_PERFORMED sentinel (no second reply)"
         )
+        return DIRECT_DELIVERY_PERFORMED
 
-        if steam_data:
-            pc = steam_data.get("player_count")
-            steam_line = _format_metric(pc, suffix=" players on Steam")
-            if steam_data.get("player_count_source") == "demo" and "demo" not in display_name.lower():
-                steam_line += " (via Demo)"
-            embed.add_field(name="🎮 Steam", value=steam_line, inline=False)
-        else:
-            embed.add_field(
-                name="🎮 Steam",
-                value="Not found on Steam",
-                inline=False,
-            )
+    if final_text:
+        return final_text.strip()
 
-        if twitch_data and twitch_data.get("configured"):
-            if twitch_found:
-                viewers = twitch_data.get("viewer_count")
-                streams = twitch_data.get("live_streams")
-                twitch_line = _format_metric(viewers, suffix=" viewers on Twitch")
-                if isinstance(streams, int):
-                    twitch_line += f"\n{streams:,} live streams"
-                embed.add_field(name="📺 Twitch", value=twitch_line, inline=False)
-            else:
-                embed.add_field(
-                    name="📺 Twitch",
-                    value="Category not found on Twitch",
-                    inline=False,
-                )
-        elif twitch_data and not twitch_data.get("configured"):
-            embed.add_field(
-                name="📺 Twitch",
-                value="Twitch not configured (TWITCH_CLIENT_ID/SECRET)",
-                inline=False,
-            )
-
-        thumb = None
-        if steam_data and steam_data.get("image_url"):
-            thumb = steam_data["image_url"]
-        elif twitch_data and twitch_data.get("image_url"):
-            thumb = twitch_data["image_url"]
-        if thumb:
-            embed.set_thumbnail(url=thumb)
-
-        embeds.append(embed)
-
-    # Winner callouts when both sides have comparable metrics
-    steam_counts = [
-        (pairs[i][0], (pairs[i][1] or {}).get("player_count"))
-        for i in range(2)
-        if pairs[i][1] and pairs[i][1].get("player_count") is not None
-    ]
-    if len(steam_counts) == 2:
-        if steam_counts[0][1] > steam_counts[1][1]:
-            header.add_field(
-                name="🏆 Steam",
-                value=f"**{steam_counts[0][0]}** leads in players",
-                inline=True,
-            )
-        elif steam_counts[1][1] > steam_counts[0][1]:
-            header.add_field(
-                name="🏆 Steam",
-                value=f"**{steam_counts[1][0]}** leads in players",
-                inline=True,
-            )
-        else:
-            header.add_field(name="🏆 Steam", value="Tie!", inline=True)
-
-    twitch_counts = [
-        (pairs[i][0], (pairs[i][2] or {}).get("viewer_count"))
-        for i in range(2)
-        if pairs[i][2] and pairs[i][2].get("found") and pairs[i][2].get("viewer_count") is not None
-    ]
-    if len(twitch_counts) == 2:
-        if twitch_counts[0][1] > twitch_counts[1][1]:
-            header.add_field(
-                name="🏆 Twitch",
-                value=f"**{twitch_counts[0][0]}** leads in viewers",
-                inline=True,
-            )
-        elif twitch_counts[1][1] > twitch_counts[0][1]:
-            header.add_field(
-                name="🏆 Twitch",
-                value=f"**{twitch_counts[1][0]}** leads in viewers",
-                inline=True,
-            )
-        else:
-            header.add_field(name="🏆 Twitch", value="Tie!", inline=True)
-
-    return embeds
+    return "✅ "
 
 
-# =============================================================================
-# Steam embed builder (shared by /steamchart, /stmchr, /topgames)
-# =============================================================================
-def _build_steam_game_embeds(games: list[dict[str, Any]]) -> list[discord.Embed]:
-    """Build one Discord embed per game from ``get_steam_game_data()`` results."""
-    embeds: list[discord.Embed] = []
-    for g in games:
-        name = g["matched_name"]
-        appid = g["appid"]
-        player_count = g.get("player_count")
-        image_url = g.get("image_url")
-        color = steam.get_game_color(name)
-        if player_count is not None:
-            description = f"**{player_count:,}** players now"
-            if g.get("player_count_source") == "demo" and "demo" not in name.lower():
-                description += " (via Steam Demo)"
-        else:
-            description = "Player count unavailable on Steam Charts right now."
-        embed = discord.Embed(
-            title=name,
-            description=description,
-            color=color,
-            url=f"https://store.steampowered.com/app/{appid}/",
-        )
-        thumb_url = image_url or f"https://cdn.cloudflare.steamstatic.com/steam/apps/{appid}/header.jpg"
-        embed.set_thumbnail(url=thumb_url)
-        embeds.append(embed)
-    return embeds
-
-
-def _build_topkorea_embed(ranking: list[dict[str, Any]]) -> discord.Embed:
-    """Build a single compact embed for the TheLog top 10 ranking (전체).
-
-    Styling:
-    - #1 uses 🥇 medal + bold (to stand out as the top / "golden")
-    - Rank changes: 🟢▲ for up (green), 🔴▼ for down (red), ⚪= for same
-      (the arrow + number get the color via emoji)
-
-    All displayed text is in English per user request.
-    Uses english_name / english_publisher when available.
-    Added 2026-06-22 for /topkorea.
-    """
-    lines: list[str] = []
-    for g in ranking:
-        ch = thelog.format_rank_change(g.get("change", 0))
-        display_name = g.get("english_name") or g.get("name", "")
-        display_pub = g.get("english_publisher") or g.get("publisher", "")
-
-        if g["rank"] == 1:
-            # Special standout for #1 (golden / top highlight)
-            # Using medal + bold to simulate "golden letters" effect in Discord
-            line = f"🥇 **{display_name}** — **{g['shares']:.2f}%** ({display_pub}) {ch}"
-        else:
-            line = f"{g['rank']}. **{display_name}** — **{g['shares']:.2f}%** ({display_pub}) {ch}"
-
-        lines.append(line)
-
-    description = "\n".join(lines) if lines else "No data available."
-
-    embed = discord.Embed(
-        title="🎮 Top 10 PC Bang Game Rankings (Overall)",
-        description=description,
-        color=0x00A8E8,
-        url="https://www.thelog.co.kr/index.do",
-    )
-    # Date from API payload (targetDate is YYYYMMDD)
-    target = None
-    if ranking:
-        raw0 = ranking[0].get("raw", {})
-        td = raw0.get("targetDate")
-        if isinstance(td, str) and len(td) == 8:
-            target = f"{td[:4]}.{td[4:6]}.{td[6:]}"
-    footer = "Source: thelog.co.kr • Real collected data"
-    if target:
-        footer += f" • {target}"
-    embed.set_footer(text=footer)
-    return embed
-
-
-def _build_korea50_embed(ranking: list[dict[str, Any]]) -> discord.Embed:
-    """Build a single compact embed for the Gamemeca weekly top 50 popularity ranking.
-
-    Everything translated to English where possible (game names via dictionary).
-    Shows genre + model (e.g. AOS / Partial Payment), publisher (English), and change for all 1-50.
-    """
-    # Small translations for genre/model so no Korean appears in the list
-    GENRE_TRANSLATIONS = {
-        "스포츠": "Sports",
-        "기타": "Other",
-        "어드벤쳐": "Adventure",
-        "액션 RPG": "Action RPG",
-        "롤플레잉": "Role-Playing",
-        "슈팅": "Shooter",
-    }
-    MODEL_TRANSLATIONS = {
-        "부분유료화": "Partial Payment",
-        "정액제": "Subscription",
-        "개발중": "In Development",
-        "유료화": "Paid",
-    }
-
-    lines: list[str] = []
-    for g in ranking:
-        display_name = g.get("english_name") or g.get("name", "")
-        display_pub = g.get("english_publisher") or g.get("publisher", "")
-        genre = g.get("genre", "")
-        model = g.get("model", "")
-
-        # Translate genre/model if we have English version
-        disp_genre = GENRE_TRANSLATIONS.get(genre, genre)
-        disp_model = MODEL_TRANSLATIONS.get(model, model)
-
-        ch = g.get("change", 0)
-        ch_str = gamemeca.format_rank_change(ch)  # always include for 1-50
-
-        extra = ""
-        if disp_genre or disp_model:
-            extra = f" — {disp_genre} / {disp_model}".strip() if disp_genre and disp_model else f" — {disp_genre or disp_model}".strip()
-
-        if g["rank"] == 1:
-            line = f"🥇 **{display_name}**{extra} ({display_pub}) {ch_str}".strip()
-        else:
-            line = f"{g['rank']}. **{display_name}**{extra} ({display_pub}) {ch_str}".strip()
-        lines.append(line)
-
-    description = "\n".join(lines) if lines else "No data available."
-
-    embed = discord.Embed(
-        title="🎮 Gamemeca Weekly Popularity Ranking (Top 50)",
-        description=description,
-        color=0x00A8E8,
-        url="https://www.gamemeca.com/ranking.php",
-    )
-    week = None
-    # week is stored in the module cache after fetch
+def _should_offer_light_decision(
+    user_message_text: str,
+    user_message: str,
+    *,
+    is_mentioned: bool,
+    is_reply_to_bot: bool,
+    context_need: str,
+) -> bool:
+    """Wrap should_offer_light_decision_tools with safe defaulting."""
     try:
-        week = gamemeca._game_rank_cache.get("week")
+        return should_offer_light_decision_tools(
+            is_mentioned=is_mentioned,
+            is_reply_to_bot=is_reply_to_bot,
+            context_need=context_need,
+            user_message=user_message_text or user_message,
+        )
+    except Exception:
+        return False
+
+
+def _should_reoffer_native_search_on_continuation(
+    prev_response: Any,
+    *,
+    native_search_tools: list[dict],
+    executed_tool_names: set[str],
+) -> bool:
+    """Conservative native-search re-offer on continuation rounds.
+
+    Default is no re-offer (rely on previous_response_id). Re-include schemas only
+    when the prior response shows search activity. Short-circuit when the model
+    just invoked respond_directly or a delivery tool in the current round.
+    """
+    if not native_search_tools:
+        return False
+
+    if executed_tool_names & _CONTINUATION_NO_SEARCH_REOFFER_TOOLS:
+        return False
+
+    try:
+        prev_output = getattr(prev_response, "output", None) or []
+        for item in prev_output:
+            itype = getattr(item, "type", None)
+            if isinstance(item, dict):
+                itype = item.get("type")
+            itype_str = str(itype or "").lower()
+
+            if itype_str == "function_call":
+                name = getattr(item, "name", None)
+                if name is None and isinstance(item, dict):
+                    name = item.get("name")
+                if name in ("web_search", "x_search"):
+                    return True
+
+            if itype_str and (
+                "web_search" in itype_str
+                or "x_search" in itype_str
+                or "search_call" in itype_str
+            ):
+                return True
     except Exception:
         pass
-    footer = "Source: gamemeca.com • Weekly ranking"
-    if week:
-        footer += f" • {week}"
-    embed.set_footer(text=footer)
-    return embed
+    return False
 
 
-# =============================================================================
-# Slash Command Registration
-# =============================================================================
-def register_slash_commands(
-    tree: "discord.app_commands.CommandTree", client: "discord.Client"
-) -> None:
-    """Only /videolimit is registered."""
+async def _prepare_first_turn_data(
+    *,
+    user_message: str,
+    channel_id: int,
+    original_message: Any,
+    image_urls: list[str] | None,
+    attachments: list[dict] | None = None,
+    referenced_context: dict | None,
+    reply_chain_contexts: list[dict] | None,
+    is_reply_continuation: bool,
+    has_x_link_intent: bool,
+    is_reply_to_bot: bool,
+    is_mentioned: bool,
+) -> dict[str, Any]:
+    """Phase 1 prep: pure-intent detection + authoritative build_responses_input."""
+    pure_video_gen_intent = False
+    pure_image_gen_intent = False
+    try:
+        if (
+            is_pure_video_generation_request(user_message)
+            and not bool(image_urls)
+            and not is_reply_continuation
+        ):
+            pure_video_gen_intent = True
+        elif (
+            is_pure_image_generation_request(user_message)
+            and not bool(image_urls)
+            and not is_reply_continuation
+        ):
+            pure_image_gen_intent = True
+    except Exception:
+        pure_video_gen_intent = False
+        pure_image_gen_intent = False
 
-    @tree.command(
-        name="videolimit",
-        description="Show your remaining video generations for today",
-    )
-    async def videolimit(interaction: discord.Interaction):
-        if interaction.guild and not is_guild_allowed(interaction.guild.id):
-            await interaction.response.send_message(
-                "Meepo is not available in this server.", ephemeral=True
-            )
-            return
-        try:
-            from ..media.video_quota import status_message
-            text = status_message(interaction.user.id, interaction.user.display_name)
-        except Exception as exc:
-            text = f"Could not read video quota: {exc}"
-        await interaction.response.send_message(text, ephemeral=True)
-
-
-# =============================================================================
-# Main Connection Function (Conversational Only)
-# =============================================================================
-async def ensure_discord_connected(conversational: bool = True) -> "discord.Client":
-    """
-    Ensures the Discord client is connected.
-
-    In the standalone Groksito bot, we always run with conversational=True.
-    This function owns the persistent Gateway WebSocket.
-    """
-    global _discord_client, _discord_task, rate_limiter, tree
-
-    if _discord_client is not None:
-        await _discord_ready.wait()
-        return _discord_client
-
-    if not settings.discord_bot_token:
-        raise RuntimeError("DISCORD_BOT_TOKEN is not configured in .env")
-
-    intents = discord.Intents.default()
-    intents.guilds = True
-    intents.members = True
-    intents.message_content = True  # Required for conversational bot
-    intents.voice_states = True
-
-    _discord_client = discord.Client(intents=intents)
-
-    logger.info("=== GROKSITO DISCORD BOT (STANDALONE) ===")
-    logger.info("CONVERSATIONAL OWNER: This process owns the persistent Gateway connection.")
-    logger.info("Full @Groksito experience enabled (native vision via Responses API, channel context, tools, image/video gen).")
-
-    rate_limiter = RateLimiter(max_requests=6, window_seconds=60)
-    tree = discord.app_commands.CommandTree(_discord_client)
-
-    _discord_client.rate_limiter = rate_limiter
-    _discord_client.command_tree = tree
-
-    # Register slash commands.
-    # This call must happen after the client and rate_limiter are attached.
-    # All three commands (/mislimites, /steamchart, /stmchr) are now defined
-    # in register_slash_commands above.
-    register_slash_commands(tree, _discord_client)
-
-    # Lazy import of conversational stack (keeps things clean)
-    from .. import context
-    # No custom memory system at all (removed for 100% Grok nativeness)
-    from ..core.conversation import (
-        _resolve_referenced_and_activation,
-        _build_referenced_context,
-        _invoke_groksito,
+    input_data = await build_responses_input(
+        user_message=user_message,
+        channel_id=channel_id,
+        original_message=original_message,
+        image_urls=image_urls,
+        attachments=attachments,
+        referenced_context=referenced_context,
+        reply_chain_contexts=reply_chain_contexts,
+        is_reply_continuation=is_reply_continuation,
+        has_x_link_intent=has_x_link_intent,
+        image_gen_intent=pure_image_gen_intent or pure_video_gen_intent,
+        is_reply_to_bot=is_reply_to_bot,
+        is_mentioned=is_mentioned,
     )
 
-# on_ready
-    @_discord_client.event
-    async def on_ready():
-        logger.info(f"Γ£à Groksito connected as {_discord_client.user} (ID: {_discord_client.user.id})")
-        logger.info(f"[Discord] discord.py version: {discord.__version__} (target: >=2.7.0,<3.0 for modern voice + features)")
+    return {
+        "input_data": input_data,
+        "pure_video_gen_intent": pure_video_gen_intent,
+        "pure_image_gen_intent": pure_image_gen_intent,
+    }
 
-        if _ALLOWED_GUILD_IDS:
-            logger.info(f"[SECURITY] Guild whitelist ACTIVE ΓÇö {len(_ALLOWED_GUILD_IDS)} allowed guild(s)")
-        else:
-            logger.warning("[SECURITY] No ALLOWED_GUILD_IDS set ΓÇö bot will respond in ANY server.")
 
-        try:
-            await _discord_client.change_presence(activity=discord.Game(name="yapping"))
-            guild = discord.Object(id=1443263158532702373)
-            await tree.sync(guild=guild)
-            logger.info("Slash commands synchronized for Everest guild")
-        except Exception as e:
-            logger.error(f"Error syncing slash commands: {e}")
+def _select_tools_for_first_turn(
+    *,
+    user_message_text: str,
+    user_message: str,
+    need: str,
+    image_urls: list[str] | None,
+    has_visual_intent: bool,
+    is_mentioned: bool,
+    is_reply_to_bot: bool,
+    is_addressed: bool,
+    pure_image_gen_intent: bool,
+    pure_video_gen_intent: bool,
+) -> dict[str, Any]:
+    """Phase 2: intent signals + custom/native tool schema selection for first turn."""
+    explicit_video_intent = has_explicit_video_intent(user_message_text)
+    explicit_audio_intent = has_explicit_audio_intent(user_message_text)
 
-        _discord_ready.set()
+    creation_visual_intent = (
+        has_visual_intent
+        or _detect_image_creation_intent(
+            user_message_text,
+            has_reference_image=bool(image_urls),
+        )
+        or (bool(image_urls) and is_image_edit_request(user_message_text, has_reference_image=True))
+    )
+    vision_or_visual_query = (
+        bool(image_urls) or _detect_visual_intent(user_message_text) or creation_visual_intent or explicit_video_intent
+    )
+    effective_visual_intent = creation_visual_intent
 
-        # Emoji / custom emote discovery (metadata only on startup).
-        # Vision descriptions + popularity ranking are done *lazily* only for emotes that actually get used
-        # in messages the bot sees. This is the efficient path for servers with 100-200+ emotes.
-        # Data lives in data/emoji_knowledge.json.
-        try:
-            from ..utils import emoji_registry
-            asyncio.create_task(emoji_registry.scan_all_accessible_emojis(_discord_client))
-            logger.info("[Emoji] Background emote metadata scan launched (vision + usage ranking is lazy on real use)")
-        except Exception as emoji_err:
-            logger.debug(f"[Emoji] Could not start emote scan (non-fatal): {emoji_err}")
+    offer_light_decision_tools = _should_offer_light_decision(
+        user_message_text,
+        user_message,
+        is_mentioned=is_mentioned,
+        is_reply_to_bot=is_reply_to_bot,
+        context_need=need,
+    )
 
-        try:
-            from ..media.daily_motivation import run_loop
-            asyncio.create_task(run_loop(_discord_client))
-            logger.info("[Motivation] Daily 09:00 NPT quote image loop launched")
-        except Exception as mot_err:
-            logger.debug(f"[Motivation] loop not started: {mot_err}")
+    custom_tools = get_tools_for_request(
+        query_need=need,
+        has_visual_intent=effective_visual_intent,
+        has_explicit_video_intent=explicit_video_intent,
+        has_explicit_audio_intent=explicit_audio_intent,
+        is_tool_continuation=False,
+        pure_image_gen=pure_image_gen_intent,
+        pure_video_gen=pure_video_gen_intent,
+        offer_light_decision_tools=offer_light_decision_tools,
+    )
 
-        # Write initial heartbeat + supporting snapshots so the web dashboard has good data immediately.
-        try:
-            from ..core.health import (
-                write_bot_heartbeat,
-                write_bot_guilds_snapshot,
-                write_bot_stats,
-                write_bot_health_snapshot,
-            )
-            guilds_list = getattr(_discord_client, "guilds", []) or []
-            guilds = len(guilds_list)
-            lat = getattr(_discord_client, "latency", None)
-            write_bot_heartbeat(
-                connected=True,
-                user=str(_discord_client.user),
-                user_id=_discord_client.user.id if _discord_client.user else None,
-                guilds=guilds,
-                latency=lat if (lat is not None and lat > 0) else None,
-            )
-            write_bot_guilds_snapshot(guilds_list)
-            write_bot_stats()
-            write_bot_health_snapshot()
-        except Exception as health_err:
-            log_auxiliary_failure(
-                logger,
-                "initial health snapshot write",
-                health_err,
-                feature="Health",
-            )
+    if need in ("casual", "image_gen") or (need == "minimal" and not is_addressed):
+        native_search_tools: list[dict] = []
+    else:
+        native_search_tools = _build_native_search_tools(
+            query_text=user_message_text,
+            context_need=need,
+            has_visual_intent=vision_or_visual_query,
+            has_attached_images=bool(image_urls),
+        )
 
-    # Extra lifecycle events for more accurate web dashboard status
-    @_discord_client.event
-    async def on_disconnect():
-        try:
-            from ..core.health import write_bot_heartbeat
-            write_bot_heartbeat(connected=False)
-        except Exception as health_err:
-            log_auxiliary_failure(
-                logger,
-                "disconnect heartbeat write",
-                health_err,
-                feature="Health",
-            )
+    return {
+        "custom_tools": custom_tools,
+        "native_search_tools": native_search_tools,
+        "effective_visual_intent": effective_visual_intent,
+        "explicit_video_intent": explicit_video_intent,
+        "explicit_audio_intent": explicit_audio_intent,
+        "offer_light_decision_tools": offer_light_decision_tools,
+    }
 
-    @_discord_client.event
-    async def on_resumed():
-        try:
-            from ..core.health import (
-                write_bot_heartbeat,
-                write_bot_guilds_snapshot,
-                write_bot_stats,
-                write_bot_health_snapshot,
-            )
-            guilds_list = getattr(_discord_client, "guilds", []) or []
-            guilds = len(guilds_list)
-            lat = getattr(_discord_client, "latency", None)
-            write_bot_heartbeat(
-                connected=True,
-                user=str(getattr(_discord_client, "user", None)),
-                user_id=getattr(getattr(_discord_client, "user", None), "id", None),
-                guilds=guilds,
-                latency=lat if (lat is not None and lat > 0) else None,
-            )
-            write_bot_guilds_snapshot(guilds_list)
-            write_bot_stats()
-            write_bot_health_snapshot()
-        except Exception as health_err:
-            log_auxiliary_failure(
-                logger,
-                "resume health snapshot write",
-                health_err,
-                feature="Health",
-            )
 
-    @_discord_client.event
-    async def on_guild_join(guild):
-        # Ensure emotes for newly joined guild (for testing multi-server scenarios)
-        # so the server-specific list is populated from live data immediately.
-        try:
-            from ..utils import emoji_registry
-            asyncio.create_task(emoji_registry.ensure_guild_emojis_registered(guild))
-            logger.info(f"[Emoji] on_guild_join: registered live emotes for guild {getattr(guild, 'id', '?')}")
-        except Exception as emoji_join_err:
-            logger.debug(f"[Emoji] on_guild_join ensure skipped (non-fatal): {emoji_join_err}")
+async def _execute_tool_loop(
+    *,
+    client: AsyncOpenAI,
+    model: str,
+    response: Any,
+    need: str,
+    user_id: str,
+    stable_prefix_len: int,
+    effective_visual_intent: bool,
+    explicit_video_intent: bool,
+    explicit_audio_intent: bool,
+    pure_image_gen_intent: bool,
+    pure_video_gen_intent: bool,
+    native_search_tools: list[dict],
+    offered_custom_tool_names: set[str],
+    original_message: Any,
+    image_urls: list[str] | None,
+    is_addressed: bool,
+    cid_p: str,
+    max_tool_rounds: int = 3,
+) -> tuple[Any, bool, bool, bool]:
+    """Phase 3: multi-round tool execution + continuation via previous_response_id.
 
-    # on_message - thin orchestrator (most logic lives in conversation.py)
-    #
-    # Invariants maintained here:
-    # - Bot's own messages are ignored immediately.
-    # - Guild whitelist is enforced first (after correlation).
-    # - Context is *always* updated for every incoming message (for optional
-    #   recent context summaries and legacy tools).
-    # - Rate limit is checked *before* any expensive work or LLM call.
-    # - Activation decision is delegated to conversation._resolve_referenced_and_activation
-    #   (the authoritative strict policy that prevents bot replies to random
-    #   user-to-user conversations).
-    # - The actual Grok call + tools + vision happens in _invoke_groksito.
-    @_discord_client.event
-    async def on_message(message: discord.Message):
-        cid_p = ""  # default if we error very early
-        try:
-            if message.author.id == _discord_client.user.id:
-                return
+    Returns (final_response, direct_delivery_performed, model_chose_search, model_chose_direct).
+    """
+    direct_delivery_performed = False
+    model_chose_search = False
+    model_chose_direct = False
+    asset_references_resolved = False
+    media_delivered = False
 
-            OWNER_ID = 253869773421674498
-            if message.guild is None:
-                if message.author.id != OWNER_ID:
-                    try:
-                        owner = _discord_client.get_user(OWNER_ID) or await _discord_client.fetch_user(OWNER_ID)
-                        who = getattr(message.author, "display_name", None) or message.author.name
-                        handle = str(message.author)
-                        text = (message.content or "").strip() or "(no text)"
-                        extra = ""
-                        atts = getattr(message.attachments, "__iter__", None)
-                        if message.attachments:
-                            extra = "\nAttachments: " + ", ".join(
-                                getattr(a, "url", "?") for a in message.attachments[:4]
-                            )
-                        await owner.send(
-                            f"Someone DMed Meepo.\n"
-                            f"Name: {who} ({handle})\n"
-                            f"ID: `{message.author.id}`\n"
-                            f"Said: {text[:1800]}{extra}"
-                        )
-                    except Exception as dm_err:
-                        logger.warning(f"Owner DM notify failed: {dm_err}")
-                    return
+    for round_num in range(1, max_tool_rounds + 1):
+        client_tool_outputs: list[dict] = []
+        round_executed_tools: set[str] = set()
 
-            author_display = getattr(message.author, "display_name", None) or getattr(message.author, "name", "Usuario")
+        output_items = getattr(response, "output", None) or []
+        for item in output_items:
+            if getattr(item, "type", None) != "function_call":
+                continue
 
-            # Generate correlation ID for this message (for full-trace logging of the interaction).
-            # Set early so activation/resolve/vision logs are associated with it.
-            cid = generate_correlation_id()
-            set_correlation_id(cid)
-            cid_p = cid_prefix()  # e.g. "cid=abc12345 "
+            name = getattr(item, "name", None)
+            if name is None and isinstance(item, dict):
+                name = item.get("name")
 
-            # Guild whitelist guard
-            if message.guild and not is_guild_allowed(message.guild.id):
-                logger.info(f"{cid_p}[SECURITY] Ignoring message from unauthorized guild {message.guild.id}")
-                return
+            if name in ("web_search", "x_search"):
+                model_chose_search = True
+            if name == "respond_directly":
+                model_chose_direct = True
 
-            # Bootstrap live emotes for *this* server so top-used list and normalize are always current.
+            raw_args = getattr(item, "arguments", None)
+            if raw_args is None and isinstance(item, dict):
+                raw_args = item.get("arguments", {})
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except Exception:
+                    raw_args = {}
+
+            call_id = getattr(item, "call_id", None) or getattr(item, "id", None)
+            if call_id is None and isinstance(item, dict):
+                call_id = item.get("call_id") or item.get("id")
+
             try:
-                from ..utils import emoji_registry
-                asyncio.create_task(emoji_registry.ensure_guild_emojis_registered(message.guild))
+                from ..config import settings as _s
+                if getattr(_s, "log_tool_selection", True):
+                    from .tools import tools_logger as _tl
+                    decision_tool_names = {
+                        "web_search",
+                        "x_search",
+                        "get_recent_context",
+                        "get_user_avatar",
+                        "get_top_server_emoji",
+                        "respond_directly",
+                    }
+                    if name in decision_tool_names:
+                        _arg_keys = (
+                            list((raw_args or {}).keys())
+                            if isinstance(raw_args, dict)
+                            else []
+                        )
+                        _tl.info(
+                            f"{cid_p}[GROK_CHOICE] tool={name} | round={round_num} | "
+                            f"keys={_arg_keys} | addressed={is_addressed}"
+                        )
             except Exception:
                 pass
 
-            # Learn which custom emotes are actually used in this server (efficient local tracking).
-            # This lets us surface only the popular ones + do vision descriptions lazily instead of
-            # processing every single one of the 100-200 emotes some servers have.
-            try:
-                from ..utils import emoji_registry
-                emoji_registry.record_emojis_from_message(message)
-            except Exception as emoji_track_err:
-                logger.debug(f"{cid_p}[Emoji] record_emojis_from_message failed (non-fatal): {emoji_track_err}")
-
-            # Always track context (for get_recent_context tool and optional summarization)
-            # Also capture images and links so the on-demand recent context summarizer (used by tool)
-            # can analyze images (vision) and do surface search on links.
-            image_urls: list[str] = []
-            links: list[str] = []
-            try:
-                # Direct attachments
-                for att in getattr(message, "attachments", []) or []:
-                    ct = getattr(att, "content_type", "") or ""
-                    if "image" in ct.lower() and getattr(att, "url", None):
-                        image_urls.append(att.url)
-                # Embeds (thumbnails / images)
-                for emb in getattr(message, "embeds", []) or []:
-                    for key in ("image", "thumbnail"):
-                        obj = getattr(emb, key, None)
-                        if obj and getattr(obj, "url", None):
-                            image_urls.append(obj.url)
-                # Links / URLs from text content
-                # Centralized URL extraction (utils/text.py).
-                # duplication with conversation.py extractors. Behavior is identical.
-                if message.content:
-                    for clean in extract_urls_from_text(message.content):
-                        if clean and clean not in links:
-                            links.append(clean)
-            except Exception as attach_err:
-                logger.warning(f"{cid_p}[Message] attachment/link extraction failed (non-fatal): {attach_err}")
-
-            context.update_from_message(
-                channel_id=message.channel.id,
-                user_id=message.author.id,
-                author_name=author_display,
-                content=message.content or "",
-                is_bot=False,
-                image_urls=image_urls,
-                links=links,
+            logger.info(
+                f"{cid_p}[LLM] Round {round_num}: executing custom tool '{name}' "
+                f"(args keys: {list((raw_args or {}).keys()) if isinstance(raw_args, dict) else 'n/a'})"
             )
 
-            # Activation decision
-            # The resolve function now contains the authoritative strict logic (refined across iterations)
-            # and emits clear per-decision logs. We still keep a defensive guard here.
-            result = await _resolve_referenced_and_activation(
-                message=message,
-                client_user=_discord_client.user,
-                author_display=author_display,
-            )
-            # result is now 6-tuple: ... , has_x_link_intent, has_image_creation_intent
-            if len(result) >= 6:
-                referenced, is_reply_to_bot, explicit_visual, is_reply_cont, has_x_link_intent, has_image_creation = result
-            else:
-                referenced, is_reply_to_bot, explicit_visual, is_reply_cont, has_x_link_intent = result if len(result) == 5 else (*result, False)
-                has_image_creation = False
-
-            # is_reply_to_bot + is_mentioned are passed down. Referenced context is injected for
-            # direct replies to Groksito OR when the bot is @mentioned inside a reply to another user
-            # (e.g. " @groksito describe the video in that link my friend just posted").
-
-            is_mentioned = _discord_client.user in getattr(message, "mentions", [])
-            raw_low = (message.content or "").lower()
-            name_called = bool(re.search(r"(?<!\w)(meepo|groksito)(?!\w)", raw_low))
-            if name_called:
-                is_mentioned = True
-
-            # === ACTIVATION GUARD ===
-            # @mention, bare name (meepo / groksito), or direct reply to the bot.
-            if not is_mentioned and not is_reply_to_bot:
-                return
-
+            available = name in offered_custom_tool_names
+            tool_type = "custom" if name in offered_custom_tool_names else "native-or-unknown"
             try:
-                from ..media.voice_channel import is_voice_control, handle_voice_command
-                if is_voice_control(message.content or ""):
-                    handled = await handle_voice_command(message)
-                    if handled:
-                        return
-            except Exception as vc_err:
-                logger.warning(f"{cid_p}[Voice] {vc_err}")
-
-            # Rate limit
-            rl = getattr(_discord_client, "rate_limiter", rate_limiter)
-            can_use, _ = rl.check(message.author.id)
-            if not can_use:
-                await _safe_reply(message, "Slow down — you already used your 6 requests this minute.", mention_author=False)
-                return
-
-            # Rich context + meta detection
-            # Note: referenced may have been fetched in resolve; fetch again only if missing
-            if message.reference and message.reference.message_id and referenced is None:
-                try:
-                    referenced = await message.channel.fetch_message(message.reference.message_id)
-                    logger.info(f"{cid_p}[Reply] Fetched referenced message in client fallback")
-                except Exception as ref_fetch_err:
-                    logger.warning(f"{cid_p}[Reply] Client fallback fetch for referenced message failed: {ref_fetch_err}")
-
-            referenced_context = await _build_referenced_context(referenced) if referenced else None
-
-            is_meta = False
-            try:
-                is_meta = context.is_conversation_meta_question(message.content or "")
-            except Exception as meta_err:
-                logger.debug(f"{cid_p}[Meta] conversation meta detection failed (non-fatal): {meta_err}")
-
-            # NOTE: No custom memory / rich channel context computation here.
-            # Only referenced message is passed; classification (is_meta) still used for logging/heuristics.
-            # All (minimal) injection decided inside llm_input.build_responses_input ([R:] on bot replies + mention-in-reply cases).
-            # Recent conversation context: on-demand via get_recent_context tool only (no pre-injection, #19).
-            # No custom memory at all (removed for maximum nativeness).
-
-            # Invoke Groksito (native context via llm_input, vision, tools)
-            # cid is already set in contextvar for all downstream logging.
-            async with message.channel.typing():
-                await _invoke_groksito(
-                    message=message,
-                    referenced=referenced,
-                    referenced_context=referenced_context,
-                    author_display=author_display,
-                    is_meta_convo=is_meta,
-                    explicit_visual_reply_intent=explicit_visual,
-                    is_reply_continuation=is_reply_cont,
-                    has_x_link_intent=has_x_link_intent,  # X/link intent signal (affects native x_search offering + ref enrichment)
-                    is_reply_to_bot=is_reply_to_bot,
-                    has_image_creation_intent=has_image_creation,
-                    is_mentioned=is_mentioned,
+                from .tools import tools_logger
+                tools_logger.debug(
+                    f"{cid_p}[TOOLS] execution | tool={name} | available={str(available).lower()} "
+                    f"| type={tool_type} | round={round_num}"
                 )
+            except Exception:
+                pass
 
-        except Exception as e:
-            logger.exception(f"{cid_p}Unhandled error in on_message: {e}")
+            try:
+                result = await execute_hybrid_tool(
+                    name=name or "unknown_tool",
+                    args=raw_args if isinstance(raw_args, dict) else {},
+                    original_message=original_message,
+                    image_urls=image_urls,
+                )
+            except Exception as tool_exec_err:
+                arg_keys = (
+                    list((raw_args or {}).keys())
+                    if isinstance(raw_args, dict)
+                    else None
+                )
+                result = format_tool_execution_error(
+                    name or "unknown_tool",
+                    tool_exec_err,
+                    round_num=round_num,
+                    arg_keys=arg_keys,
+                )
+                logger.error(f"{cid_p}[TOOLS] {result}", exc_info=True)
 
-    # Start the bot
-    async def _runner():
+            if name:
+                round_executed_tools.add(name)
+
+            result_str = str(result)
+            logger.info(
+                f"{cid_p}[LLM] Round {round_num}: tool '{name}' completed, "
+                f"result length={len(result_str)}"
+            )
+
+            if name in ASSET_RESOLVER_TOOLS and "RESOLVED" in result_str.upper():
+                asset_references_resolved = True
+
+            if name in MEDIA_ACTION_TOOLS:
+                if _is_direct_delivery_success(result_str, name or "", cid_p):
+                    direct_delivery_performed = True
+                    if name in _MEDIA_DELIVERY_TOOLS:
+                        media_delivered = True
+
+            client_tool_outputs.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": result_str[:4000],
+            })
+
+        if not client_tool_outputs:
+            logger.info(
+                f"{cid_p}[LLM] Round {round_num}: no more client-side tool calls "
+                "— conversation complete."
+            )
+            break
+
+        if direct_delivery_performed:
+            premature_reply = (
+                asset_references_resolved
+                and not media_delivered
+                and bool(round_executed_tools & {"reply_to_user"})
+                and not (round_executed_tools & _MEDIA_DELIVERY_TOOLS)
+            )
+            if premature_reply:
+                logger.info(
+                    f"{cid_p}[LLM] Round {round_num}: suppressing premature reply_to_user "
+                    "short-circuit — asset reference resolved but media tool not called yet"
+                )
+                direct_delivery_performed = False
+            else:
+                logger.info(
+                    f"{cid_p}[LLM] Round {round_num}: direct delivery performed "
+                    "— short-circuiting (skip sending tool results back + no further rounds). "
+                    "Natural + cheap."
+                )
+                break
+
+        logger.info(
+            f"{cid_p}[LLM] Round {round_num}: sending back {len(client_tool_outputs)} "
+            "tool result(s) using previous_response_id"
+        )
+
         try:
-            await _discord_client.start(settings.discord_bot_token)
-        except Exception as exc:
-            logger.error(f"Discord connection failed: {exc}", exc_info=True)
-            _discord_ready.clear()
+            prev_id = getattr(response, "id", None)
+            cache_key = _get_prompt_cache_key(original_message)
 
-    _discord_task = asyncio.create_task(_runner())
-    logger.info("Starting Groksito Discord connection (CONVERSATIONAL OWNER)...")
+            has_resolved_asset_references = asset_references_resolved and bool(image_urls)
+            pending_media_after_asset = (
+                has_resolved_asset_references
+                and (explicit_video_intent or effective_visual_intent)
+                and not media_delivered
+            )
+
+            continuation_tools = get_tools_for_request(
+                query_need=need,
+                has_visual_intent=effective_visual_intent,
+                has_explicit_video_intent=explicit_video_intent,
+                has_explicit_audio_intent=explicit_audio_intent,
+                is_tool_continuation=True,
+                pure_image_gen=pure_image_gen_intent,
+                pure_video_gen=pure_video_gen_intent,
+                has_resolved_asset_references=has_resolved_asset_references,
+                pending_media_after_asset=pending_media_after_asset,
+            )
+
+            continuation_native_search_tools = (
+                native_search_tools
+                if _should_reoffer_native_search_on_continuation(
+                    response,
+                    native_search_tools=native_search_tools,
+                    executed_tool_names=round_executed_tools,
+                )
+                else []
+            )
+
+            offered_custom_tool_names = {t.get("name") for t in continuation_tools if t.get("name")}
+            try:
+                img_search = False
+                img_understand = False
+                for t in continuation_native_search_tools:
+                    if t.get("type") == "web_search":
+                        img_search = t.get("enable_image_search", False)
+                        img_understand = t.get("enable_image_understanding", False)
+                        break
+
+                log_tool_selection(
+                    turn_type="continuation",
+                    query_need=need,
+                    has_visual_intent=effective_visual_intent,
+                    custom_tools=continuation_tools,
+                    native_search_tools=continuation_native_search_tools,
+                    enable_image_search=img_search,
+                    enable_image_understanding=img_understand,
+                )
+            except Exception as log_err:
+                logger.debug(f"{cid_p}[TOOLS] selection logging failed (continuation): {log_err}")
+
+            response = await _call_responses_with_retry(
+                client,
+                model=model,
+                input=client_tool_outputs,
+                previous_response_id=prev_id,
+                tools=[
+                    *continuation_native_search_tools,
+                    *continuation_tools,
+                ],
+                extra_body={"prompt_cache_key": cache_key},
+            )
+        except Exception as continue_err:
+            logger.warning(
+                f"{cid_p}[LLM] Continuation with previous_response_id failed: {continue_err} "
+                "— stopping tool loop"
+            )
+            break
+
+        continuation_cache_context = {
+            "turn_type": "continuation",
+            "query_need": need,
+            "has_visual_intent": effective_visual_intent,
+            "custom_tools_count": len(continuation_tools),
+            "custom_tools_set": _infer_tools_set_name(need, effective_visual_intent, True),
+            "user_id": user_id,
+            "prefix_stability_indicator": f"sys~{stable_prefix_len}",
+        }
+
+        _extract_and_log_token_usage(
+            response,
+            model=model,
+            has_images=bool(image_urls),
+            category="Tool",
+            is_tool_continuation=True,
+            cache_context=continuation_cache_context,
+        )
+
+    return response, direct_delivery_performed, model_chose_search, model_chose_direct
+
+
+async def call_grok_for_groksito(
+    user_message: str,
+    author_name: str,
+    channel_id: int,
+    original_message: Any = None,
+    image_urls: list[str] | None = None,
+    attachments: list[dict] | None = None,
+    referenced_context: dict | None = None,
+    reply_chain_contexts: list[dict] | None = None,  # deeper reply ancestors for text referents (links, "what the user said", etc.)
+    has_visual_intent: bool = False,
+    is_reply_continuation: bool = False,
+    has_x_link_intent: bool = False,
+    is_reply_to_bot: bool = False,  # Direct reply to one of our messages (affects referenced context + some heuristics)
+    is_mentioned: bool = False,
+) -> str | object:
+    """
+    Main entry point from the conversational flow (Responses API + hybrid tool loop).
+
+    Key efficiency features on continuations (using previous_response_id):
+    - Custom tools are minimized via get_continuation_tools (only reply_to_user by default).
+    - Native search tools (web_search + x_search) are NOT re-sent by default.
+      (x_search is offered less frequently overall due to stricter signal checks on first turn.)
+      We rely on the model retaining prior tool declarations via previous_response_id
+      (see comment in the continuation block for details + conditional re-inclusion
+      if search was used in the prior round). This reduces token bloat from tool
+      schemas/descriptions on follow-up turns.
+
+    Returns:
+        - str: normal final assistant text
+        - DIRECT_DELIVERY_PERFORMED sentinel: a media tool already replied directly
+    """
+    cid_p = cid_prefix()
+    logger.debug(f"{cid_p}[LLM] call_grok_for_groksito called for {author_name}")
+
+    model = getattr(settings, "grok_model", None) or "grok-4.3"
+
+    # Resolve bearer via central helper: prefers valid OAuth token (proactive refresh) when available,
+    # with seamless fallback to XAI_API_KEY. Works for GROK_AUTH_MODE=auto / oauth / (even api_key if token present).
+    bearer: Optional[str] = None
+    if _get_grok_bearer:
+        bearer = _get_grok_bearer()
+    if not bearer:
+        bearer = getattr(settings, "xai_api_key", None) or os.getenv("XAI_API_KEY")  # last-ditch env
+    if not bearer:
+        logger.warning("[LLM] No Grok credential (no OAuth token and no XAI_API_KEY). Using stub response.")
+        return _build_stub_response(user_message, author_name, image_urls)
+
+    if settings.using_oauth or (settings.auth_mode == "auto" and bearer and len(bearer) < 100):  # rough heuristic: oauth tokens are JWT-ish
+        logger.debug("[LLM] Using xAI Grok OAuth bearer (SuperGrok / X Premium+)")
+    else:
+        logger.debug("[LLM] Using XAI_API_KEY (api_key mode or oauth fallback)")
 
     try:
-        await asyncio.wait_for(_discord_ready.wait(), timeout=30.0)
-    except asyncio.TimeoutError:
-        raise RuntimeError("Timeout waiting for Discord connection. Check token and network.")
+        # Apply configured timeout to the client (affects all responses.create calls).
+        # This prevents indefinite hangs on slow/stuck xAI endpoints.
+        client = AsyncOpenAI(
+            api_key=bearer,
+            base_url="https://api.x.ai/v1",
+            timeout=settings.api_timeout_seconds,
+        )
 
-    # -------------------------------------------------------------------------
-    # Background heartbeat task (lets the separate web dashboard know we're alive)
-    # Writes every ~35s so the web can show a green "Connected" indicator + basic stats.
-    # -------------------------------------------------------------------------
-    async def _heartbeat_updater() -> None:
-        while True:
-            try:
-                await asyncio.sleep(35)
-                if _discord_client and getattr(_discord_client, "is_ready", lambda: False)():
-                    try:
-                        from ..core.health import (
-                            write_bot_heartbeat,
-                            write_bot_guilds_snapshot,
-                            write_bot_stats,
-                            write_bot_health_snapshot,
-                        )
-                        guilds_list = getattr(_discord_client, "guilds", []) or []
-                        guilds = len(guilds_list)
-                        lat = getattr(_discord_client, "latency", None)
-                        write_bot_heartbeat(
-                            connected=True,
-                            user=str(getattr(_discord_client, "user", None)),
-                            user_id=getattr(getattr(_discord_client, "user", None), "id", None),
-                            guilds=guilds,
-                            latency=lat if (lat is not None and lat > 0) else None,
-                        )
-                        write_bot_guilds_snapshot(guilds_list)
-                        write_bot_stats()
-                        write_bot_health_snapshot()
-                    except Exception as health_err:
-                        log_auxiliary_failure(
-                            logger,
-                            "periodic health snapshot write",
-                            health_err,
-                            feature="Health",
-                            level=logging.DEBUG,
-                        )
-            except asyncio.CancelledError:
-                break
-            except Exception as heartbeat_err:
-                # Never let the heartbeat task kill the bot
-                log_auxiliary_failure(
-                    logger,
-                    "heartbeat updater tick",
-                    heartbeat_err,
-                    feature="Health",
+        # Proactive summarization ΓÇö disabled by default (maximum nativeness).
+        # Grok's large context handles long threads naturally. Enable only for pathological cases.
+        if getattr(settings, "summarization_enabled", False):
+            await _maybe_proactive_summarize(channel_id, original_message, client)
+
+        # === Phase 1: Credential prep (above) + input construction ===
+        prep = await _prepare_first_turn_data(
+            user_message=user_message,
+            channel_id=channel_id,
+            original_message=original_message,
+            image_urls=image_urls,
+            attachments=attachments,
+            referenced_context=referenced_context,
+            reply_chain_contexts=reply_chain_contexts,
+            is_reply_continuation=is_reply_continuation,
+            has_x_link_intent=has_x_link_intent,
+            is_reply_to_bot=is_reply_to_bot,
+            is_mentioned=is_mentioned,
+        )
+        input_data = prep["input_data"]
+        pure_video_gen_intent = prep["pure_video_gen_intent"]
+        pure_image_gen_intent = prep["pure_image_gen_intent"]
+
+        initial_input = input_data["initial_input"]
+        stable_prefix_len = input_data["stable_prefix_len"]
+        need = input_data["need"]
+        user_id = input_data["user_id"]
+        user_message_text = input_data["user_message_text"]
+        is_addressed = bool(is_mentioned or is_reply_to_bot)
+
+        if has_x_link_intent:
+            logger.info(f"{cid_p}[LLM] X/Link intent detected in reply — boosting context awareness for referenced links")
+
+        # === Phase 2: First-turn tool selection + native search offering ===
+        tool_selection = _select_tools_for_first_turn(
+            user_message_text=user_message_text,
+            user_message=user_message,
+            need=need,
+            image_urls=image_urls,
+            has_visual_intent=has_visual_intent,
+            is_mentioned=is_mentioned,
+            is_reply_to_bot=is_reply_to_bot,
+            is_addressed=is_addressed,
+            pure_image_gen_intent=pure_image_gen_intent,
+            pure_video_gen_intent=pure_video_gen_intent,
+        )
+        custom_tools = tool_selection["custom_tools"]
+        native_search_tools = tool_selection["native_search_tools"]
+        effective_visual_intent = tool_selection["effective_visual_intent"]
+        explicit_video_intent = tool_selection["explicit_video_intent"]
+        explicit_audio_intent = tool_selection["explicit_audio_intent"]
+
+        # Structured tool selection logging
+        offered_custom_tool_names = {t.get("name") for t in custom_tools if t.get("name")}
+        try:
+            img_search = False
+            img_understand = False
+            for t in native_search_tools:
+                if t.get("type") == "web_search":
+                    img_search = t.get("enable_image_search", False)
+                    img_understand = t.get("enable_image_understanding", False)
+                    break
+
+            log_tool_selection(
+                turn_type="first_turn",
+                query_need=need,
+                has_visual_intent=effective_visual_intent,
+                custom_tools=custom_tools,
+                native_search_tools=native_search_tools,
+                enable_image_search=img_search,
+                enable_image_understanding=img_understand,
+            )
+        except Exception as log_err:
+            logger.debug(f"{cid_p}[TOOLS] selection logging failed: {log_err}")
+
+        # Lightweight instrumentation for addressed turns only.
+        # Capture start for first-turn + full tool loop latency; flag for search schemas offered.
+        addressed_turn_start = time.time() if is_addressed else None
+        search_schemas_offered = bool(native_search_tools)
+
+        # First call to Responses API (vision images are sent here)
+        # Uses retry helper for transients (429/5xx/timeout); non-transients (policy, auth, bad payload) fail fast for caller classification.
+        try:
+            cache_key = _get_prompt_cache_key(original_message)
+            response = await _call_responses_with_retry(
+                client,
+                model=model,
+                input=initial_input,
+                tools=[
+                    *native_search_tools,
+                    *custom_tools,
+                ],
+                extra_body={"prompt_cache_key": cache_key},
+            )
+        except Exception as api_err:
+            is_404 = is_image_fetch_404_error(api_err, has_images=bool(image_urls))
+            has_media = bool(image_urls) or bool(attachments)
+            cache_key = _get_prompt_cache_key(original_message)
+
+            async def _retry_first_turn(
+                *,
+                retry_images: list,
+                retry_attachments: list | None,
+                retry_ref: dict | None,
+                retry_chain: list | None,
+                retry_reply_cont: bool,
+                label: str,
+            ):
+                rebuilt = await build_responses_input(
+                    user_message=user_message,
+                    channel_id=channel_id,
+                    original_message=original_message,
+                    image_urls=retry_images,
+                    attachments=retry_attachments,
+                    referenced_context=retry_ref,
+                    reply_chain_contexts=retry_chain,
+                    is_reply_continuation=retry_reply_cont,
+                    has_x_link_intent=has_x_link_intent,
+                    image_gen_intent=pure_image_gen_intent or pure_video_gen_intent,
+                    is_reply_to_bot=False,
+                    is_mentioned=is_mentioned,
                 )
-                await asyncio.sleep(10)
+                logger.warning(f"{cid_p}[LLM] {label}")
+                return await _call_responses_with_retry(
+                    client,
+                    model=model,
+                    input=rebuilt["initial_input"],
+                    tools=[*native_search_tools, *custom_tools],
+                    extra_body={"prompt_cache_key": cache_key},
+                )
 
-    asyncio.create_task(_heartbeat_updater())
+            if _is_policy_denied(api_err):
+                logger.warning(
+                    f"{cid_p}[LLM][POLICY] First turn denied ({api_err}). "
+                    "Retrying stripped (no media, no reply context)."
+                )
+                try:
+                    response = await _retry_first_turn(
+                        retry_images=[],
+                        retry_attachments=[],
+                        retry_ref=None,
+                        retry_chain=None,
+                        retry_reply_cont=False,
+                        label="[POLICY] stripped retry",
+                    )
+                    image_urls = []
+                    attachments = []
+                    referenced_context = None
+                    reply_chain_contexts = None
+                    logger.info(f"{cid_p}[LLM][POLICY] Stripped retry succeeded.")
+                except Exception as policy_retry_err:
+                    logger.error(f"{cid_p}[LLM][POLICY] Stripped retry failed: {policy_retry_err}")
+                    raise
 
-    return _discord_client
+            elif is_404 or has_media:
+                if is_404:
+                    logger.warning(
+                        f"{cid_p}[LLM][VISION] Image fetch 404 from xAI backend for {len(image_urls or [])} provided URL(s). "
+                        f"These were likely stale Discord signed attachment URLs or transient embed previews from recent channel history. "
+                        f"Retrying first turn WITHOUT images (attachments metadata preserved if any)."
+                    )
+                else:
+                    logger.warning(
+                        f"{cid_p}[LLM][ATTACHMENTS] Responses API first-turn trouble (non-404 processing error, e.g. GIF/unsupported) "
+                        f"with attachments={len(attachments or [])} (image_urls={len(image_urls or [])}). "
+                        f"Retrying with image_urls cleared but attachments kept so model receives metadata."
+                    )
+                try:
+                    response = await _retry_first_turn(
+                        retry_images=[],
+                        retry_attachments=attachments,
+                        retry_ref=referenced_context,
+                        retry_chain=reply_chain_contexts,
+                        retry_reply_cont=is_reply_continuation,
+                        label="[ATTACHMENTS] retry images cleared",
+                    )
+                    image_urls = []
+                    logger.info(f"{cid_p}[LLM][ATTACHMENTS] First-turn retry with attachments (images cleared) succeeded.")
+                except Exception as retry_err:
+                    logger.error(f"{cid_p}[LLM][ATTACHMENTS] Retry without images also failed: {retry_err}")
+                    raise
+            else:
+                raise
+
+        # Capture first-turn prompt tokens for addressed metrics (minimal extraction, reuse patterns from _extract)
+        first_turn_prompt_tokens = 0
+        try:
+            usage = getattr(response, "usage", None)
+            if usage is None and isinstance(response, dict):
+                usage = response.get("usage")
+            if usage:
+                if hasattr(usage, "input_tokens"):
+                    first_turn_prompt_tokens = getattr(usage, "input_tokens", 0) or 0
+                elif isinstance(usage, dict):
+                    first_turn_prompt_tokens = usage.get("input_tokens", 0) or 0
+        except Exception:
+            first_turn_prompt_tokens = 0
+
+        # Token logging for first turn
+        category = "Vision" if image_urls else "Conversation"
+        first_turn_cache_context = {
+            "turn_type": "first_turn",
+            "query_need": need,
+            "has_visual_intent": effective_visual_intent,
+            "custom_tools_count": len(custom_tools),
+            "custom_tools_set": _infer_tools_set_name(need, effective_visual_intent, False),
+            "user_id": user_id,
+            "prefix_stability_indicator": f"sys~{stable_prefix_len}",
+        }
+        _extract_and_log_token_usage(
+            response,
+            model=model,
+            has_images=bool(image_urls),
+            category=category,
+            is_tool_continuation=False,
+            cache_context=first_turn_cache_context,
+        )
+
+        # === Phase 3: Tool execution loop + continuation (previous_response_id) ===
+        response, direct_delivery_performed, model_chose_search, model_chose_direct = (
+            await _execute_tool_loop(
+                client=client,
+                model=model,
+                response=response,
+                need=need,
+                user_id=user_id,
+                stable_prefix_len=stable_prefix_len,
+                effective_visual_intent=effective_visual_intent,
+                explicit_video_intent=explicit_video_intent,
+                explicit_audio_intent=explicit_audio_intent,
+                pure_image_gen_intent=pure_image_gen_intent,
+                pure_video_gen_intent=pure_video_gen_intent,
+                native_search_tools=native_search_tools,
+                offered_custom_tool_names=offered_custom_tool_names,
+                original_message=original_message,
+                image_urls=image_urls,
+                is_addressed=is_addressed,
+                cid_p=cid_p,
+            )
+        )
+
+        # Emit addressed-turn metrics (lightweight, defensive).
+        if is_addressed and addressed_turn_start is not None:
+            try:
+                latency_ms = (time.time() - addressed_turn_start) * 1000.0
+                from ..utils.token_usage import log_addressed_turn_metrics
+                log_addressed_turn_metrics(
+                    latency_ms=latency_ms,
+                    prompt_tokens=first_turn_prompt_tokens,
+                    search_schemas_offered=search_schemas_offered,
+                    model_chose_search=model_chose_search,
+                    model_chose_direct=model_chose_direct,
+                    query_need=need or "unknown",
+                )
+            except Exception:
+                pass  # never break main flow for metrics
+
+        # Final extraction + sentinel handling
+        return _finalize_response(response, direct_delivery_performed, cid_p)
+
+    except Exception as e:
+        logger.exception(f"{cid_p}Error during real Responses API call + tool loop")
+
+        if _is_policy_denied(e):
+            return "Can't do that request."
+
+        if image_urls and not attachments:
+            logger.warning(f"{cid_p}[LLM][VISION] Failing request had {len(image_urls)} image(s) attached.")
+            return "Error. <@253869773421674498>, Check logs to fix it."
+
+        if attachments:
+            logger.warning(f"{cid_p}[LLM][ATTACHMENTS] Failing request had {len(attachments)} attachment(s).")
+
+        if isinstance(e, (RateLimitError,)) or "rate" in str(e).lower() or "429" in str(e).lower():
+            return "Error. <@253869773421674498>, Check logs to fix it."
+        if isinstance(e, (APITimeoutError, APIConnectionError)) or "timeout" in str(e).lower() or "connection" in str(e).lower():
+            return "Error. <@253869773421674498>, Check logs to fix it."
+
+        if isinstance(e, APIError):
+            status = getattr(e, "status_code", None)
+            if status and 500 <= status < 600:
+                return "Error. <@253869773421674498>, Check logs to fix it."
+            if status == 401:
+                return "Error. <@253869773421674498>, Check logs to fix it."
+
+        return "Error. <@253869773421674498>, Check logs to fix it."
+
+    # (auth error hints are also emitted by get_grok_bearer / refresh logic and --test-auth)
 
 
-__all__ = ["ensure_discord_connected", "is_guild_allowed", "rate_limiter"]
+# Backwards-compatibility aliases (used by some older wiring / tests)
+_call_grok_with_tools = call_grok_for_groksito
+_call_grok_responses_api = call_grok_for_groksito
+
+# Public alias for call_grok_with_tools (kept for compatibility)
+# This allows existing call sites (e.g. conversation.py) to continue working without immediate breakage.
+call_grok_with_tools = call_grok_for_groksito

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from ..utils.correlation import cid_prefix
@@ -90,6 +91,18 @@ def _chunk_discord_text(text: str, limit: int = DISCORD_CONTENT_LIMIT) -> list[s
         rest = rest[cut:].lstrip()
     return [c for c in chunks if c]
 
+
+
+def _strip_grok_ui_markup(text: str) -> str:
+    """Remove Grok-app render tags that 4.7 leaks into Discord."""
+    text = text or ""
+    text = re.sub(r"<grok\b[^>]*>.*?</grok>", "", text, flags=re.I | re.S)
+    text = re.sub(r"<grok\b[^>/]*/>", "", text, flags=re.I)
+    text = re.sub(r"\[\s*(?:web|post|collection|connector)\s*:\s*\d+\s*\]", "", text, flags=re.I)
+    text = re.sub(r"render_inline_citation|render_generated_image|render_edited_image|render_searched_image", "", text, flags=re.I)
+    text = re.sub(r"citation_id\s*=\s*['\"]?\d+['\"]?", "", text, flags=re.I)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 
@@ -191,7 +204,8 @@ async def execute_hybrid_tool(
                 except Exception as emoji_norm_err:
                     tools_logger.debug(f"[Emoji] reply_to_user normalization skipped (non-fatal): {emoji_norm_err}")
 
-                pieces = _chunk_discord_text(str(content or ""))
+                content = _strip_grok_ui_markup(str(content or ""))
+                pieces = _chunk_discord_text(content)
                 if not pieces:
                     pieces = ["."]
                 await original_message.reply(pieces[0], mention_author=False)
@@ -244,7 +258,7 @@ async def execute_hybrid_tool(
             if not original_message:
                 return "Cannot create thread: missing original message context for this turn."
             thread_name = str(args.get("name", "Discussion")).strip()[:100] or "Discussion"
-            content = str(args.get("content", "")).strip()
+            content = _strip_grok_ui_markup(str(args.get("content", "")).strip())
             if not content:
                 return "create_thread requires non-empty 'content' for the initial thread message."
             try:

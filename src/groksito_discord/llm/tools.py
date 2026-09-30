@@ -51,6 +51,7 @@ from .media_tools import (
     _handle_generate_video,
     _handle_generate_image,
     _handle_edit_image,
+    _handle_search_edit_image,
     _generate_audio_schema,
     _handle_generate_audio,
     ENABLE_VIDEO_GENERATION,
@@ -144,6 +145,35 @@ def _generate_image_schema_tiny() -> dict:
         }
     }
 
+
+
+def _search_edit_image_schema() -> dict:
+    return {
+        "type": "function",
+        "name": "search_edit_image",
+        "description": (
+            "Search the web for an existing public photo of a named subject "
+            "(game boss, character, place), pick one, edit it with Imagine, "
+            "and send the edited file in Discord. Use this when they want a "
+            "REAL screenshot restyled (full frame, no UI), not a from-scratch generate. "
+            "Do not use generate_image for 'find her picture and edit it'."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "search_query": {
+                    "type": "string",
+                    "description": "What to find, e.g. Where Winds Meet Moongazing Maiden 望月婵媛",
+                },
+                "edit_prompt": {
+                    "type": "string",
+                    "description": "How to edit the found photo. User wording first.",
+                },
+                "aspect_ratio": {"type": "string"},
+            },
+            "required": ["search_query", "edit_prompt"],
+        },
+    }
 
 def _edit_image_schema() -> dict:
     return {
@@ -298,6 +328,9 @@ async def execute_hybrid_tool(
 
         if name == "edit_image":
             return await _handle_edit_image(args, original_message, image_urls)
+
+        if name == "search_edit_image":
+            return await _handle_search_edit_image(args, original_message)
 
         if name == "generate_video":
             if not ENABLE_VIDEO_GENERATION:
@@ -567,6 +600,7 @@ def _append_visual_media_tools(
     if has_visual_intent:
         tools.append(_generate_image_schema())
         tools.append(_edit_image_schema())
+        tools.append(_search_edit_image_schema())
         if ENABLE_VIDEO_GENERATION:
             try:
                 tools.append(_generate_video_schema())

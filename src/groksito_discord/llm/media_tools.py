@@ -50,6 +50,7 @@ from ..media.image_handler import (
     _handle_generate_image,
     _handle_edit_image,
 )
+from ..media.search_edit import _handle_search_edit_image
 
 # Audio / TTS — served from dedicated handler (src/groksito_discord/media/audio_handler.py)
 # The handler resolves tts_default_voice / tts_default_language from settings (pydantic + .env, editable in web UI)

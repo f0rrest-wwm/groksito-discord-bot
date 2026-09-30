@@ -486,8 +486,11 @@ async def _tool_generate_image(
 
     requested_prompt = (user_caption_source or prompt or "").strip() or prompt
     requested_prompt = _rewrite_creator_boss_prompt(requested_prompt)
-    expanded = await _expand_like_website(requested_prompt)
-    expanded = _rewrite_creator_boss_prompt(expanded)
+    if len(requested_prompt) < 80:
+        expanded = await _expand_like_website(requested_prompt)
+        expanded = _rewrite_creator_boss_prompt(expanded)
+    else:
+        expanded = requested_prompt
     current_prompt = _enhance_prompt_for_api(expanded, is_edit=False)
     current_prompt = _strip_elon(current_prompt)
     if _is_boss_or_creator_request(prompt or "") or _is_boss_or_creator_request(user_caption_source or ""):
@@ -783,10 +786,19 @@ async def _tool_edit_image(
     refs = await _resolve_edit_reference_urls(refs)
     seed = (user_caption_source or prompt or "").strip() or prompt
     seed = _rewrite_creator_boss_prompt(seed)
-    expanded = await _expand_like_website(seed)
-    expanded = _rewrite_creator_boss_prompt(expanded)
-    enhanced_prompt = _enhance_prompt_for_api(expanded, is_edit=True)
+    # Do NOT run _expand_like_website on edits. That rewrite invents a new pose
+    # and makes /v1/images/edits behave like text-to-image (this-chat vs Meepo gap).
+    enhanced_prompt = _enhance_prompt_for_api(seed, is_edit=True)
     enhanced_prompt = _strip_elon(enhanced_prompt)
+    enhanced_prompt = (
+        "Edit the attached reference image only. Keep the same camera, composition, "
+        "poses, character identities, and layout. Apply only this change: "
+        + enhanced_prompt
+    )
+    logger.info(
+        f"{cid_prefix()}[Image] edit refs={len(refs)} user[:160]={seed[:160]!r} "
+        f"api[:160]={enhanced_prompt[:160]!r}"
+    )
     low = seed.lower()
     if not aspect_ratio and re.search(r"9\s*[:x]\s*16|portrait|phone poster|key art", low):
         aspect_ratio = "9:16"

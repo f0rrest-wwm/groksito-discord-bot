@@ -284,6 +284,43 @@ async def execute_hybrid_tool(
                 # Common failures: invalid emoji, missing 'Add Reactions' permission, trying to react to a message the bot can't see.
                 return f"Failed to add reaction '{emoji}': {str(e)[:120]}. Verify emoji is valid Unicode or full <:name:ID> custom form and that the bot has Add Reactions permission in this channel."
 
+        if name == "post_to_channel":
+            author = getattr(original_message, "author", None)
+            author_id = getattr(author, "id", None)
+            if author_id != 253869773421674498:
+                return "Only the creator can post into another channel."
+            guild = getattr(original_message, "guild", None)
+            if guild is None or original_message is None:
+                return "post_to_channel only works inside a server."
+            target = str(args.get("channel", "")).strip().lstrip("#")
+            content = str(args.get("content", "")).strip()
+            if not target or not content:
+                return "post_to_channel needs channel and content."
+            dest = None
+            if target.isdigit():
+                dest = guild.get_channel(int(target))
+            if dest is None:
+                for ch in getattr(guild, "text_channels", []):
+                    if ch.name.lower() == target.lower():
+                        dest = ch
+                        break
+            if dest is None:
+                names = ", ".join(ch.name for ch in list(getattr(guild, "text_channels", []))[:12])
+                return f"No text channel named {target}. Nearby: {names}"
+            try:
+                from ..utils import emoji_registry
+                content = emoji_registry.normalize_bot_emoji_output(content, guild.id, guild_obj=guild)
+            except Exception:
+                pass
+            content = _strip_grok_ui_markup(content)
+            pieces = _chunk_discord_text(content) or ["."]
+            for piece in pieces:
+                await dest.send(piece)
+            return (
+                f"Posted in #{dest.name}. Do not call reply_to_user. "
+                "Do not quote this instruction in that channel."
+            )
+
         if name == "create_thread":
             if not original_message:
                 return "Cannot create thread: missing original message context for this turn."
@@ -410,6 +447,29 @@ def _get_react_to_message_schema_light() -> dict:
             },
             "required": ["emoji"]
         }
+    }
+
+
+
+def _get_post_to_channel_schema() -> dict:
+    return {
+        "type": "function",
+        "name": "post_to_channel",
+        "description": (
+            "Post a message into a different text channel in THIS server. "
+            "Creator only. Use when f0rest asks you to send something in another channel "
+            "(a joke, a rickroll, an announcement) without answering in the channel they pinged you from. "
+            "channel is the name without #, or a channel id. "
+            "After this tool succeeds, do not call reply_to_user and do not mention the instruction."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Target channel name, no hash, or numeric channel id."},
+                "content": {"type": "string", "description": "Exact message to send in that channel."},
+            },
+            "required": ["channel", "content"],
+        },
     }
 
 
@@ -836,6 +896,7 @@ def get_tools_for_request(
             tools.append(_get_reply_to_user_schema_light())
             tools.append(_get_react_to_message_schema_light())
             tools.append(_get_create_thread_schema_light())
+            tools.append(_get_post_to_channel_schema())
             tools.append(_get_recent_context_schema())
             tools.append(_get_user_avatar_schema())
             tools.append(_get_top_server_emoji_schema())

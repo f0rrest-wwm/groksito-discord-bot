@@ -574,6 +574,13 @@ async def ensure_discord_connected(conversational: bool = True) -> "discord.Clie
         except Exception as mot_err:
             logger.debug(f"[Motivation] loop not started: {mot_err}")
 
+        try:
+            from ..media.weekly_timers import run_loop as weekly_timers_loop
+            asyncio.create_task(weekly_timers_loop(_discord_client))
+            logger.info("[WeeklyTimers] loop launched")
+        except Exception as wt_err:
+            logger.debug(f"[WeeklyTimers] loop not started: {wt_err}")
+
         # Write initial heartbeat + supporting snapshots so the web dashboard has good data immediately.
         try:
             from ..core.health import (

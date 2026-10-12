@@ -1,5 +1,5 @@
 """Post the Aion 2 weekly reset checklist every Wednesday at 07:00 UTC.
-Also posts once on first start if the channel has never received one.
+JP server (UTC+9). Also posts once on first start if the channel has never received one.
 
 Env:
   WEEKLY_TIMERS_CHANNEL_ID   required Discord channel id
@@ -82,17 +82,12 @@ def _next_weekday_at(weekday: int, hour: int, minute: int = 0, now: datetime | N
     return target
 
 
-def _next_rift(now: datetime | None = None) -> datetime:
-    """Spacetime Rift portals every 3 hours at 02, 05, 08, 11, 14, 17, 20, 23 UTC+9.
-    Global server clock is UTC+9, so those hours are 17, 20, 23, 02, 05, 08, 11, 14 UTC.
-    """
+def _next_from_hours(hours: tuple[int, ...], now: datetime | None = None) -> datetime:
     now = now or datetime.now(UTC)
-    # Rift hours in UTC (server is UTC+9, rifts at 02/05/08/11/14/17/20/23 server)
-    rift_hours_utc = (17, 20, 23, 2, 5, 8, 11, 14)
     candidates = []
     for day_offset in (0, 1):
         day = (now + timedelta(days=day_offset)).replace(minute=0, second=0, microsecond=0)
-        for h in rift_hours_utc:
+        for h in hours:
             t = day.replace(hour=h)
             if t > now:
                 candidates.append(t)
@@ -102,15 +97,26 @@ def _next_rift(now: datetime | None = None) -> datetime:
 def _message() -> str:
     now = datetime.now(UTC)
     reset = _next_reset(now)
-    siege_mon = _next_weekday_at(0, 12, 0, now)  # Mon 21:00 UTC+9 = 12:00 UTC
-    siege_thu = _next_weekday_at(3, 12, 0, now)
-    siege_sat = _next_weekday_at(5, 12, 0, now)
-    rift = _next_rift(now)
+    # JP is UTC+9. Server hours below are converted to UTC.
+    siege_mon = _next_weekday_at(0, 12, 0, now)   # Mon 21:00 JST
+    siege_thu = _next_weekday_at(3, 12, 0, now)   # Thu 21:00 JST
+    siege_sat = _next_weekday_at(5, 12, 0, now)   # Sat 21:00 JST
+    exec_mon = _next_weekday_at(0, 12, 30, now)   # Mon 21:30 JST
+    exec_thu = _next_weekday_at(3, 12, 30, now)
+    exec_sat = _next_weekday_at(5, 12, 30, now)
+    nahma_sun = _next_weekday_at(6, 12, 0, now)   # Sun 21:00 JST
+    nahma_fri = _next_weekday_at(4, 12, 0, now)   # Fri 21:00 JST
+    # Rifts: 02/05/08/11/14/17/20/23 JST -> 17/20/23/02/05/08/11/14 UTC
+    rift = _next_from_hours((17, 20, 23, 2, 5, 8, 11, 14), now)
+    # Watcher Kaira: 01/04/07/10/13/16/19/22 JST -> 16/19/22/01/04/07/10/13 UTC
+    kaira = _next_from_hours((16, 19, 22, 1, 4, 7, 10, 13), now)
+    # Arena of Tactics: 11:00 and 19:00 JST -> 02:00 and 10:00 UTC
+    arena = _next_from_hours((2, 10), now)
     return (
-        "**Aion 2 — Weekly reset**\n"
-        f"Next reset: {_ts(reset, 'F')} ({_ts(reset, 'R')})\n"
-        "Global. The timestamp is your local time.\n\n"
-        "**Entries that refill at that reset**\n"
+        "**Aion 2 — JP server timers**\n"
+        f"Next weekly reset: {_ts(reset, 'F')} ({_ts(reset, 'R')})\n"
+        "Timestamps are your local time. Server clock is JST.\n\n"
+        "**Entries that refill at the reset**\n"
         "• Daily Dungeon — 14\n"
         "• Ascension Trial — 3\n"
         "• Expeditions / Conquest / Transcendence — weekly cube limit\n"
@@ -118,16 +124,19 @@ def _message() -> str:
         "• Arena — victory / participation rewards\n"
         "• Battlefield — 3 victory + 3 participation\n"
         "• Shop limits — Odyle Energy, Spiritstones, Instant Clear\n\n"
-        "**Still daily (not this post)**\n"
-        "• Duty quests — 5\n"
-        "• Nightmare — 2 a day, stores to 14\n"
-        "• Shugo Festa keys — 3\n"
-        "• Odyle Energy — +15 every 3 hours\n\n"
-        "**Next timers**\n"
-        f"• Artifact Siege — {_ts(siege_mon, 'F')} ({_ts(siege_mon, 'R')}) · Mon\n"
-        f"• Artifact Siege — {_ts(siege_thu, 'F')} ({_ts(siege_thu, 'R')}) · Thu\n"
-        f"• Artifact Siege — {_ts(siege_sat, 'F')} ({_ts(siege_sat, 'R')}) · Sat\n"
-        f"• Next Spacetime Rift — {_ts(rift, 'F')} ({_ts(rift, 'R')})\n\n"
+        "**World bosses (Chaotic Lower Reshanta)**\n"
+        f"• Watcher Kaira — {_ts(kaira, 'F')} ({_ts(kaira, 'R')})\n"
+        f"• Executor Tamasa / Kaira / Argo — {_ts(exec_thu, 'F')} ({_ts(exec_thu, 'R')})\n"
+        f"• Executor Tamasa / Kaira / Argo — {_ts(exec_sat, 'F')} ({_ts(exec_sat, 'R')})\n"
+        f"• Executor Tamasa / Kaira / Argo — {_ts(exec_mon, 'F')} ({_ts(exec_mon, 'R')})\n"
+        f"• Guardian Lord Nahma — {_ts(nahma_fri, 'F')} ({_ts(nahma_fri, 'R')})\n"
+        f"• Guardian Lord Nahma — {_ts(nahma_sun, 'F')} ({_ts(nahma_sun, 'R')})\n\n"
+        "**Other timers**\n"
+        f"• Artifact Siege — {_ts(siege_thu, 'F')} ({_ts(siege_thu, 'R')})\n"
+        f"• Artifact Siege — {_ts(siege_sat, 'F')} ({_ts(siege_sat, 'R')})\n"
+        f"• Artifact Siege — {_ts(siege_mon, 'F')} ({_ts(siege_mon, 'R')})\n"
+        f"• Next Spacetime Rift — {_ts(rift, 'F')} ({_ts(rift, 'R')})\n"
+        f"• Next Arena of Tactics — {_ts(arena, 'F')} ({_ts(arena, 'R')})\n\n"
         "Burn leftover weekly entries before the reset. They do not stack."
     )
 
@@ -156,7 +165,6 @@ async def run_loop(client) -> None:
         return
     logger.info("[WeeklyTimers] Wednesday 07:00 UTC loop started")
 
-    # First run: post immediately if the channel has never had one.
     if not _has_ever_posted():
         try:
             week = datetime.now(UTC).strftime("%G-W%V")

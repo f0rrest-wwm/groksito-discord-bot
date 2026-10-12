@@ -52,22 +52,65 @@ def _mark_sent(week: str) -> None:
     )
 
 
-def _seconds_until_next() -> float:
-    now = datetime.now(UTC)
+def _next_reset(now: datetime | None = None) -> datetime:
+    now = now or datetime.now(UTC)
     days_ahead = (RESET_WEEKDAY - now.weekday()) % 7
     target = (now + timedelta(days=days_ahead)).replace(
         hour=RESET_HOUR, minute=0, second=0, microsecond=0
     )
     if target <= now:
         target += timedelta(days=7)
-    return max(5.0, (target - now).total_seconds())
+    return target
+
+
+def _seconds_until_next() -> float:
+    return max(5.0, (_next_reset() - datetime.now(UTC)).total_seconds())
+
+
+def _ts(dt: datetime, style: str = "F") -> str:
+    return f"<t:{int(dt.timestamp())}:{style}>"
+
+
+def _next_weekday_at(weekday: int, hour: int, minute: int = 0, now: datetime | None = None) -> datetime:
+    now = now or datetime.now(UTC)
+    days_ahead = (weekday - now.weekday()) % 7
+    target = (now + timedelta(days=days_ahead)).replace(
+        hour=hour, minute=minute, second=0, microsecond=0
+    )
+    if target <= now:
+        target += timedelta(days=7)
+    return target
+
+
+def _next_rift(now: datetime | None = None) -> datetime:
+    """Spacetime Rift portals every 3 hours at 02, 05, 08, 11, 14, 17, 20, 23 UTC+9.
+    Global server clock is UTC+9, so those hours are 17, 20, 23, 02, 05, 08, 11, 14 UTC.
+    """
+    now = now or datetime.now(UTC)
+    # Rift hours in UTC (server is UTC+9, rifts at 02/05/08/11/14/17/20/23 server)
+    rift_hours_utc = (17, 20, 23, 2, 5, 8, 11, 14)
+    candidates = []
+    for day_offset in (0, 1):
+        day = (now + timedelta(days=day_offset)).replace(minute=0, second=0, microsecond=0)
+        for h in rift_hours_utc:
+            t = day.replace(hour=h)
+            if t > now:
+                candidates.append(t)
+    return min(candidates) if candidates else now + timedelta(hours=3)
 
 
 def _message() -> str:
+    now = datetime.now(UTC)
+    reset = _next_reset(now)
+    siege_mon = _next_weekday_at(0, 12, 0, now)  # Mon 21:00 UTC+9 = 12:00 UTC
+    siege_thu = _next_weekday_at(3, 12, 0, now)
+    siege_sat = _next_weekday_at(5, 12, 0, now)
+    rift = _next_rift(now)
     return (
-        "**Aion 2 — Weekly reset (Wednesday 07:00 UTC)**\n"
-        "Global servers. Local time shifts with daylight saving.\n\n"
-        "**Entries that refill**\n"
+        "**Aion 2 — Weekly reset**\n"
+        f"Next reset: {_ts(reset, 'F')} ({_ts(reset, 'R')})\n"
+        "Global. The timestamp is your local time.\n\n"
+        "**Entries that refill at that reset**\n"
         "• Daily Dungeon — 14\n"
         "• Ascension Trial — 3\n"
         "• Expeditions / Conquest / Transcendence — weekly cube limit\n"
@@ -80,10 +123,12 @@ def _message() -> str:
         "• Nightmare — 2 a day, stores to 14\n"
         "• Shugo Festa keys — 3\n"
         "• Odyle Energy — +15 every 3 hours\n\n"
-        "**Abyss schedule (server time)**\n"
-        "• Artifact Siege — Mon / Thu / Sat 21:00\n"
-        "• Spacetime Rift — every 3 hours\n\n"
-        "Burn leftover weekly entries before next Wednesday. They do not stack."
+        "**Next timers**\n"
+        f"• Artifact Siege — {_ts(siege_mon, 'F')} ({_ts(siege_mon, 'R')}) · Mon\n"
+        f"• Artifact Siege — {_ts(siege_thu, 'F')} ({_ts(siege_thu, 'R')}) · Thu\n"
+        f"• Artifact Siege — {_ts(siege_sat, 'F')} ({_ts(siege_sat, 'R')}) · Sat\n"
+        f"• Next Spacetime Rift — {_ts(rift, 'F')} ({_ts(rift, 'R')})\n\n"
+        "Burn leftover weekly entries before the reset. They do not stack."
     )
 
 
